@@ -2,14 +2,11 @@
 .SYNOPSIS
     Windows User PATH Environment Variable TUI Editor.
 .DESCRIPTION
-    A keyboard-driven Text User Interface (TUI) for viewing, navigating,
-    modifying, adding, deleting, and reordering entries in the Windows User
+    A keyboard-driven (TUI) for editing entries in your 
     PATH environment variable (HKCU\Environment\Path).
     
     Compatible with Windows PowerShell 5.1 and PowerShell 7+ on Windows 11.
     Requires no third-party modules or dependencies.
-.EXAMPLE
-    .\PathEditor.ps1
 #>
 
 [CmdletBinding()]
@@ -186,11 +183,6 @@ function Save-UserPath {
     
     # Save to User environment variable in Windows registry
     [Environment]::SetEnvironmentVariable("Path", $newPathString, [System.EnvironmentVariableTarget]::User)
-    
-    # Update current session PATH so child commands also inherit it
-    # try {
-    #     $env:Path = $newPathString
-    # } catch {}
     
     # Reload from User environment to verify and show current saved content
     Load-UserPath
