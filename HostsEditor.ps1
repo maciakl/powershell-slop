@@ -79,6 +79,7 @@ $script:Visible      = New-Object 'System.Collections.Generic.List[int]'   # ind
 $script:Pos          = 0        # selected row (index into Visible)
 $script:Top          = 0        # first row of Visible shown on screen
 $script:HideComments = $false
+$script:HScroll      = 0        # horizontal scroll of the list, in characters
 $script:Status       = ''
 $script:StatusColor  = [ConsoleColor]::Gray
 $script:Stats        = @{ Changed = 0; Invalid = 0; Hosts = 0 }
@@ -333,6 +334,15 @@ function Show-Screen {
 
         # list
         $numW = [Math]::Max(3, $script:Entries.Count.ToString().Length)
+        $avail = $w - (3 + $numW + 2)
+
+        # don't scroll further right than the longest line on screen needs
+        $longest = 0
+        for ($p = $script:Top; $p -lt [Math]::Min($count, $script:Top + $listH); $p++) {
+            $longest = [Math]::Max($longest, (Expand-Tabs $script:Entries[$script:Visible[$p]].Text).Length)
+        }
+        $script:HScroll = [Math]::Max(0, [Math]::Min($script:HScroll, $longest - $avail))
+
         for ($r = 0; $r -lt $listH; $r++) {
             $y = 2 + $r
             $p = $script:Top + $r
@@ -360,8 +370,11 @@ function Show-Screen {
 
             $num  = ($idx + 1).ToString().PadLeft($numW) + '  '
             $textX = 3 + $num.Length
-            $avail = $w - $textX
             $text = Expand-Tabs $e.Text
+            if ($script:HScroll -gt 0) {
+                if ($text.Length -gt $script:HScroll) { $text = $script:Ellipsis + $text.Substring($script:HScroll + 1) }
+                else { $text = '' }
+            }
             if ($text.Length -gt $avail) { $text = $text.Substring(0, [Math]::Max(0, $avail - 1)) + $script:Ellipsis }
 
             Write-At 0 $y ($m1 + $m2 + ' ') $fg $bg
@@ -382,8 +395,8 @@ function Show-Screen {
         }
         Write-At 0 ($H - 3) (Get-Fitted $statusText $w) $statusColor
 
-        Write-Segments ($H - 2) (Get-KeyHelp @('Enter', 'Edit', 'A', 'Add', 'Del', 'Delete/restore', 'U', 'Undo', 'C/#', 'Comment/uncomment', 'H', 'Hide comments'))
-        Write-Segments ($H - 1) (Get-KeyHelp @('S', 'Save', 'R', 'Reload', 'Q/Esc', 'Quit', 'Arrows PgUp PgDn Home End', 'Move'))
+        Write-Segments ($H - 2) (Get-KeyHelp @('Enter', 'Edit', 'A', 'Add', 'Del', 'Delete/restore', 'U', 'Undo', 'C/#', 'Comment/uncomment', 'F', 'Hide comments'))
+        Write-Segments ($H - 1) (Get-KeyHelp @('S', 'Save', 'R', 'Reload', 'Q/Esc', 'Quit', 'j/k', 'Down/up', 'h/l', 'Scroll left/right', 'PgUp PgDn Home End', 'Move'))
     } catch {
         # The window was probably resized while drawing; force a full redraw next time.
         $script:LastW = 0
@@ -676,7 +689,7 @@ function Switch-HideComments {
     $sel = Get-SelectedIndex
     $script:HideComments = -not $script:HideComments
     Update-View $sel
-    if ($script:HideComments) { Set-Status 'Unchanged comments and blank lines are hidden (H to show them).' DarkYellow }
+    if ($script:HideComments) { Set-Status 'Unchanged comments and blank lines are hidden (F to show them).' DarkYellow }
     else { Set-Status 'Showing all lines.' DarkYellow }
 }
 
@@ -770,6 +783,12 @@ function Invoke-ListKey([ConsoleKeyInfo]$Key) {
     switch ($Key.Key) {
         'UpArrow'   { Move-Selection -1 }
         'DownArrow' { Move-Selection 1 }
+        'K'         { Move-Selection -1 }
+        'J'         { Move-Selection 1 }
+        'LeftArrow'  { $script:HScroll -= 8 }
+        'RightArrow' { $script:HScroll += 8 }
+        'H'         { $script:HScroll -= 8 }
+        'L'         { $script:HScroll += 8 }
         'PageUp'    { Move-Selection (-$page) }
         'PageDown'  { Move-Selection $page }
         'Home'      { $script:Pos = 0 }
@@ -783,7 +802,7 @@ function Invoke-ListKey([ConsoleKeyInfo]$Key) {
         'D'         { Switch-Delete }
         'U'         { Undo-CurrentEntry }
         'C'         { Switch-Comment }
-        'H'         { Switch-HideComments }
+        'F'         { Switch-HideComments }
         'S'         { [void](Save-HostsFile) }
         'R'         { Request-Reload }
         'F5'        { Request-Reload }
