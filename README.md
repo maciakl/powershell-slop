@@ -1,6 +1,6 @@
-# Windows User PATH TUI Editor
+# PathEditor
 
-A standalone, keyboard-driven Text User Interface (TUI) tool for managing your Windows **User** `PATH` environment variable (`HKCU\Environment\Path`).
+Keyboard-driven TUI for managing your your `PATH` environment variable on Windows (`HKCU\Environment\Path`).
 
 Written in pure PowerShell compatible with Windows PowerShell 5.1 (shipped out-of-the-box with Windows 11) and PowerShell 7+. Requires no external dependencies or modules.
 
@@ -23,8 +23,7 @@ Written in pure PowerShell compatible with Windows PowerShell 5.1 (shipped out-o
   - Full keyboard accessibility: navigate buttons using `Tab` and `Arrow` keys, or trigger actions with direct hotkeys (`S`, `A`, `E`, `D`, `R`, `X`).
 - **Safe Save & Automatic Reload**:
   - Writes new PATH entries directly to the Windows User environment in the registry.
-  - Broadcasts environment changes and updates the calling PowerShell session.
-  - Displays a success notification banner upon saving: `✔ Content was saved! Reloaded User PATH (N active entries).`
+  - Displays a success notification banner upon saving: `✔ Content was saved! (N active entries).`
   - Instantly reloads the variable from the registry and resets colors/status badges to reflect the clean saved state.
 - **In-Place Modal Editors**:
   - Interactive text editor dialogs for adding and modifying entries with full line editing (arrows, Backspace, Delete, Home, End).
