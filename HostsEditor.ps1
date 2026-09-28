@@ -39,11 +39,34 @@ if (-not (Test-IsAdministrator) -or $Host.Name -eq 'Windows PowerShell ISE Host'
     $exe = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path -LiteralPath $exe)) { $exe = Join-Path $PSHOME 'pwsh.exe' }
     $argList = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
-    try {
-        Start-Process -FilePath $exe -ArgumentList $argList -Verb RunAs | Out-Null
-    } catch {
-        Write-Host 'Administrator rights are required to edit the hosts file. Elevation was cancelled or failed:' -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Red
+
+    # Inside Windows Terminal (WT_SESSION is set), reopen in Windows Terminal rather than
+    # letting Windows pick the default console host. wt.exe treats ';' as a command separator.
+    $launches = @()
+    $wt = Get-Command 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($env:WT_SESSION -and $wt) {
+        $wtArgs = 'new-tab --title "Hosts Editor" "{0}" {1}' -f $exe, $argList
+        $launches += ,@($wt.Source, ($wtArgs -replace ';', '\;'))
+    }
+    $launches += ,@($exe, $argList)
+
+    for ($i = 0; $i -lt $launches.Count; $i++) {
+        try {
+            # Process.Start (unlike Start-Process) surfaces the Win32 error code.
+            $psi = New-Object System.Diagnostics.ProcessStartInfo $launches[$i][0], $launches[$i][1]
+            $psi.UseShellExecute = $true
+            $psi.Verb = 'runas'
+            [void][System.Diagnostics.Process]::Start($psi)
+            break
+        } catch {
+            $native = $_.Exception.GetBaseException() -as [System.ComponentModel.Win32Exception]
+            # 1223 = the user declined the UAC prompt; don't ask again with the fallback.
+            if ($i -eq $launches.Count - 1 -or ($native -and $native.NativeErrorCode -eq 1223)) {
+                Write-Host 'Administrator rights are required to edit the hosts file. Elevation was cancelled or failed:' -ForegroundColor Red
+                Write-Host $_.Exception.Message -ForegroundColor Red
+                break
+            }
+        }
     }
     return
 }
