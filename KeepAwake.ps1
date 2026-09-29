@@ -9,6 +9,9 @@
       keyboard and is ignored by practically every app). This resets the
       system's "last input" timer, which is what Teams/Slack/etc. use to
       decide you are idle.
+    - Pauses itself while the workstation is locked or going to sleep, so a
+      manual lock (Win+L) or manual Sleep behaves normally: the display turns
+      off and the PC sleeps on its usual timeouts. Resumes on unlock.
     - Shows a coffee cup tray icon; right-click it and choose Exit to stop.
     - Hides its console window by relaunching itself hidden.
 
@@ -184,6 +187,52 @@ $timer.Add_Tick({
     [KeepAwake.Native]::PressF15()
 })
 
+# --- Pause while locked / sleeping ------------------------------------------
+# When the user locks the screen or puts the PC to sleep manually, drop our
+# execution-state request and stop injecting keys so Windows can turn off the
+# display and sleep on its normal timeouts. Resume when the session unlocks.
+$script:locked = $false
+
+function Suspend-KeepAwake {
+    $timer.Stop()
+    [void][KeepAwake.Native]::SetThreadExecutionState($ES_CONTINUOUS)
+    $tray.Text = 'Keep Awake - paused'
+    $title.Text = "$([char]0x2615) Keep Awake is paused"
+}
+
+function Resume-KeepAwake {
+    Set-Awake
+    [KeepAwake.Native]::PressF15()
+    $timer.Start()
+    $tray.Text = 'Keep Awake - active'
+    $title.Text = "$([char]0x2615) Keep Awake is active"
+}
+
+$sessionHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
+    param($s, $e)
+    switch ($e.Reason) {
+        { $_ -in 'SessionLock', 'ConsoleDisconnect', 'RemoteDisconnect' } {
+            $script:locked = $true
+            Suspend-KeepAwake
+        }
+        'SessionUnlock' {
+            $script:locked = $false
+            Resume-KeepAwake
+        }
+    }
+}
+[Microsoft.Win32.SystemEvents]::add_SessionSwitch($sessionHandler)
+
+$powerHandler = [Microsoft.Win32.PowerModeChangedEventHandler]{
+    param($s, $e)
+    switch ($e.Mode) {
+        'Suspend' { Suspend-KeepAwake }
+        # If waking lands on the lock screen, stay paused until SessionUnlock.
+        'Resume'  { if (-not $script:locked) { Resume-KeepAwake } }
+    }
+}
+[Microsoft.Win32.SystemEvents]::add_PowerModeChanged($powerHandler)
+
 $exitItem.Add_Click({
     $timer.Stop()
     $tray.Visible = $false
@@ -199,6 +248,8 @@ try {
 } finally {
     # Restore normal power behaviour and clean up.
     [Microsoft.Win32.SystemEvents]::remove_UserPreferenceChanged($themeHandler)
+    [Microsoft.Win32.SystemEvents]::remove_SessionSwitch($sessionHandler)
+    [Microsoft.Win32.SystemEvents]::remove_PowerModeChanged($powerHandler)
     [void][KeepAwake.Native]::SetThreadExecutionState($ES_CONTINUOUS)
     $timer.Dispose()
     $tray.Visible = $false
