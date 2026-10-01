@@ -7,6 +7,7 @@ A single-file PowerShell script that shows IP address information for the networ
 - Subnet (network/prefix and mask)
 - Default gateway
 - Primary DNS server
+- MAC address
 - Interface name
 
 It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no external dependencies.
@@ -14,8 +15,9 @@ It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no exte
 ## Usage
 
 ```powershell
-.\Get-Ip.ps1 [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-AsText]
-             [-ApiUrl <url>] [-TimeoutSec <seconds>] [-Help]
+.\Get-Ip.ps1 [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-MacAddress]
+             [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
+             [-Version] [-Help]
 ```
 
 | Switch        | Aliases                  | Description |
@@ -24,12 +26,14 @@ It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no exte
 | `-LocalIP`    | `-Local`, `-LAN`         | Local LAN IP only |
 | `-Gateway`    | `-GW`                    | Default gateway only |
 | `-Dns`        | `-DnsServer`             | Primary DNS server only |
+| `-MacAddress` | `-Mac`, `-PhysicalAddress` | MAC address only |
 | `-AsText`     |                          | Emit plain text instead of an object when piped or captured |
 | `-ApiUrl`     | `-Url`, `-Api`           | Use your own routable IP lookup service |
 | `-TimeoutSec` |                          | Timeout for the routable IP lookup (default `10`) |
+| `-Version`    |                          | Show the script version |
 | `-Help`       | `-h`                     | Show usage |
 
-The `-RoutableIP`, `-LocalIP`, `-Gateway` and `-Dns` switches can be combined. They output the address only, with no label, one per line in the order listed above.
+The `-RoutableIP`, `-LocalIP`, `-Gateway`, `-Dns` and `-MacAddress` switches can be combined. They output the address only, with no label, one per line in the order listed above.
 
 `Get-Help .\Get-Ip.ps1 -Full` also works.
 
@@ -52,10 +56,11 @@ Local IP        : 192.168.1.20
 Subnet          : 192.168.1.0/24 (255.255.255.0)
 Default Gateway : 192.168.1.1
 DNS Server      : 192.168.1.1
+MAC Address     : 00-1A-2B-3C-4D-5E
 Interface       : Ethernet (Intel(R) Ethernet Controller)
 ```
 
-The object has the properties `RoutableIP`, `LocalIP`, `Subnet`, `DefaultGateway`, `DnsServer` and `Interface`. With value switches, only the selected properties are included.
+The object has the properties `RoutableIP`, `LocalIP`, `Subnet`, `DefaultGateway`, `DnsServer`, `MacAddress` and `Interface`. With value switches, only the selected properties are included.
 
 ## Examples
 
@@ -68,6 +73,12 @@ The object has the properties `RoutableIP`, `LocalIP`, `Subnet`, `DefaultGateway
 
 # Local IP and gateway, one per line
 .\Get-Ip.ps1 -LocalIP -Gateway
+
+# Just the MAC address
+.\Get-Ip.ps1 -MacAddress
+
+# Script version
+.\Get-Ip.ps1 -Version
 
 # Work with the object
 .\Get-Ip.ps1 | Select-Object LocalIP, DefaultGateway
@@ -86,7 +97,7 @@ $gw = (.\Get-Ip.ps1 -Gateway).DefaultGateway
 ## How it works
 
 - **Routable IP**: queried from `https://api.ipify.org`. If that fails, the script falls back to `https://checkip.amazonaws.com` and then `https://ipv4.icanhazip.com`. A URL given with `-ApiUrl` is used on its own, with no fallback. The service may return plain text or JSON with an `ip` property.
-- **Interface selection**: the script asks Windows which local address it would use to reach the lookup host (a UDP socket "connect", which sends no packets). The subnet, gateway and DNS server come from that same interface. If you're on a VPN, that's the VPN interface. If no route is available, it falls back to the first active interface with an IPv4 default gateway.
+- **Interface selection**: the script asks Windows which local address it would use to reach the lookup host (a UDP socket "connect", which sends no packets). The subnet, gateway, DNS server and MAC address come from that same interface. If you're on a VPN, that's the VPN interface. If no route is available, it falls back to the first active interface with an IPv4 default gateway.
 - **Output detection**: PowerShell doesn't tell a script when its output is redirected with `>`, so the script parses the command line it was invoked from to see whether its output is piped, captured or redirected.
 
 ## Exit codes

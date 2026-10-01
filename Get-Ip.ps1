@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
     Displays routable (public) IP, local LAN IP, subnet, default gateway and
-    primary DNS server for the network interface used to reach the internet.
+    primary DNS server, MAC address and interface name for the network
+    interface used to reach the internet.
 
 .DESCRIPTION
     Output adapts to where it is going:
@@ -10,7 +11,7 @@
       * Redirected to file -> plain text (">", "| Out-File", "| Set-Content",
                               "| Add-Content", or stdout redirected from cmd)
 
-    The -RoutableIP, -LocalIP, -Gateway and -Dns switches output only the
+    The -RoutableIP, -LocalIP, -Gateway, -Dns and -MacAddress switches output only the
     address(es), with no labels, one per line in that order. Piped output is
     still an object unless -AsText is used.
 
@@ -28,6 +29,9 @@
 .PARAMETER Dns
     Show only the primary DNS server.
 
+.PARAMETER MacAddress
+    Show only the MAC (physical) address of the interface.
+
 .PARAMETER AsText
     When piped or captured, emit plain text instead of a PowerShell object.
 
@@ -38,8 +42,14 @@
 .PARAMETER TimeoutSec
     Timeout in seconds for the routable IP lookup. Default: 10.
 
+.PARAMETER Version
+    Show the script version.
+
 .PARAMETER Help
     Show usage information.
+
+.NOTES
+    Version: 1.1.0
 
 .EXAMPLE
     .\Get-Ip.ps1
@@ -67,6 +77,9 @@ param(
     [Alias('DnsServer')]
     [switch]$Dns,
 
+    [Alias('Mac', 'PhysicalAddress')]
+    [switch]$MacAddress,
+
     [switch]$AsText,
 
     [Alias('Url', 'Api')]
@@ -75,6 +88,8 @@ param(
     [ValidateRange(1, 300)]
     [int]$TimeoutSec = 10,
 
+    [switch]$Version,
+
     [Alias('h')]
     [switch]$Help
 )
@@ -82,6 +97,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$ScriptVersion = '1.1.0'
 $scriptInvocation = $MyInvocation
 $defaultApiUrls = @(
     'https://api.ipify.org'
@@ -96,32 +112,38 @@ $fields = [ordered]@{
     Subnet         = @{ Label = 'Subnet';          Color = 'Yellow' }
     DefaultGateway = @{ Label = 'Default Gateway'; Color = 'Magenta' }
     DnsServer      = @{ Label = 'DNS Server';      Color = 'Magenta' }
+    MacAddress     = @{ Label = 'MAC Address';     Color = 'DarkYellow' }
     Interface      = @{ Label = 'Interface';       Color = 'DarkGray' }
 }
 
 function Show-Usage {
     $name = Split-Path -Leaf $PSCommandPath
     @"
-Usage: $name [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-AsText]
-             [-ApiUrl <url>] [-TimeoutSec <seconds>] [-Help]
+$name version $ScriptVersion
+
+Usage: $name [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-MacAddress]
+             [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
+             [-Version] [-Help]
 
 Displays IP address information for the network interface used to reach
 the internet.
 
 With no switches, shows the routable IP, local LAN IP, subnet, default
-gateway, primary DNS server and interface name. Value switches can be
-combined to show only those values.
+gateway, primary DNS server, MAC address and interface name. Value
+switches can be combined to show only those values.
 
 Switches:
   -RoutableIP   Routable (public) IP only.  Aliases: -Routable, -Public
   -LocalIP      Local LAN IP only.          Aliases: -Local, -LAN
   -Gateway      Default gateway only.       Aliases: -GW
   -Dns          Primary DNS server only.    Aliases: -DnsServer
+  -MacAddress   MAC address only.           Aliases: -Mac, -PhysicalAddress
   -AsText       Emit plain text instead of an object when piped/captured.
   -ApiUrl       Public IP lookup service URL (plain text or JSON {"ip":..}).
                 Default: $($defaultApiUrls[0])
                 (falls back to $($defaultApiUrls[1..($defaultApiUrls.Count - 1)] -join ', '))
   -TimeoutSec   Timeout for the public IP lookup. Default: 10
+  -Version      Show the script version.
   -Help         Show this help.                Aliases: -h
 
 Output:
@@ -135,6 +157,7 @@ Examples:
   $name
   $name -RoutableIP
   $name -LocalIP -Gateway
+  $name -MacAddress
   $name | Select-Object LocalIP, DefaultGateway
   $name -RoutableIP -AsText | Set-Clipboard
   $name > ipinfo.txt
@@ -320,7 +343,7 @@ function Get-NetworkPrefix {
 function Get-LocalNetworkInfo {
     param([string]$RouteHost)
 
-    $result = [ordered]@{ LocalIP = $null; Subnet = $null; DefaultGateway = $null; DnsServer = $null; Interface = $null }
+    $result = [ordered]@{ LocalIP = $null; Subnet = $null; DefaultGateway = $null; DnsServer = $null; MacAddress = $null; Interface = $null }
     $source = Get-SourceAddress -TargetHost $RouteHost
 
     $nics = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
@@ -350,6 +373,8 @@ function Get-LocalNetworkInfo {
     $props = $nic.GetIPProperties()
 
     $result.LocalIP = $unicast.Address.ToString()
+    $macBytes = $nic.GetPhysicalAddress().GetAddressBytes()
+    if ($macBytes.Length -gt 0) { $result.MacAddress = ($macBytes | ForEach-Object { $_.ToString('X2') }) -join '-' }
     $result.Interface = if ($nic.Description -and $nic.Description -ne $nic.Name) { "$($nic.Name) ($($nic.Description))" } else { $nic.Name }
 
     $prefixLength = $null
@@ -385,6 +410,11 @@ if ($Help) {
     return
 }
 
+if ($Version) {
+    $ScriptVersion
+    return
+}
+
 $mode = Get-OutputMode -Invocation $scriptInvocation
 if ($mode -eq 'Object' -and $AsText) { $mode = 'Text' }
 Write-Verbose "Output mode: $mode"
@@ -394,6 +424,7 @@ if ($RoutableIP) { $selected += 'RoutableIP' }
 if ($LocalIP)    { $selected += 'LocalIP' }
 if ($Gateway)    { $selected += 'DefaultGateway' }
 if ($Dns)        { $selected += 'DnsServer' }
+if ($MacAddress) { $selected += 'MacAddress' }
 $showAll = $selected.Count -eq 0
 if ($showAll) { $selected = @($fields.Keys) }
 
