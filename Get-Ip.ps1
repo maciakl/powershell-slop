@@ -2,7 +2,9 @@
 .SYNOPSIS
     Displays routable (public) IP, local LAN IP, subnet, default gateway and
     primary DNS server, MAC address and interface name for the network
-    interface used to reach the internet.
+    interface used to reach the internet. When that interface is a VPN, the
+    local details come from the physical adapter the VPN runs over, and the
+    VPN address and interface are shown separately.
 
 .DESCRIPTION
     Output adapts to where it is going:
@@ -11,7 +13,7 @@
       * Redirected to file -> plain text (">", "| Out-File", "| Set-Content",
                               "| Add-Content", or stdout redirected from cmd)
 
-    The -RoutableIP, -LocalIP, -Gateway, -Dns and -MacAddress switches output only the
+    The -RoutableIP, -LocalIP, -Gateway, -Dns, -MacAddress and -VpnIP switches output only the
     address(es), with no labels, one per line in that order. Piped output is
     still an object unless -AsText is used.
 
@@ -32,6 +34,10 @@
 .PARAMETER MacAddress
     Show only the MAC (physical) address of the interface.
 
+.PARAMETER VpnIP
+    Show only the VPN IP address. If no VPN is in use, nothing is shown and
+    the exit code is 1.
+
 .PARAMETER AsText
     When piped or captured, emit plain text instead of a PowerShell object.
 
@@ -49,7 +55,7 @@
     Show usage information.
 
 .NOTES
-    Version: 1.1.0
+    Version: 1.3.0
 
 .EXAMPLE
     .\Get-Ip.ps1
@@ -80,6 +86,9 @@ param(
     [Alias('Mac', 'PhysicalAddress')]
     [switch]$MacAddress,
 
+    [Alias('Vpn')]
+    [switch]$VpnIP,
+
     [switch]$AsText,
 
     [Alias('Url', 'Api')]
@@ -97,7 +106,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.3.0'
 $scriptInvocation = $MyInvocation
 $defaultApiUrls = @(
     'https://api.ipify.org'
@@ -105,7 +114,8 @@ $defaultApiUrls = @(
     'https://ipv4.icanhazip.com'
 )
 
-# Field definitions, in display order.
+# Field definitions, in display order. Optional fields are left out of the
+# full text/console display when they have no value.
 $fields = [ordered]@{
     RoutableIP     = @{ Label = 'Routable IP';     Color = 'Green' }
     LocalIP        = @{ Label = 'Local IP';        Color = 'Cyan' }
@@ -114,6 +124,8 @@ $fields = [ordered]@{
     DnsServer      = @{ Label = 'DNS Server';      Color = 'Magenta' }
     MacAddress     = @{ Label = 'MAC Address';     Color = 'DarkYellow' }
     Interface      = @{ Label = 'Interface';       Color = 'DarkGray' }
+    VpnIP          = @{ Label = 'VPN IP';          Color = 'Cyan';     Optional = $true }
+    VpnInterface   = @{ Label = 'VPN Interface';   Color = 'DarkGray'; Optional = $true }
 }
 
 function Show-Usage {
@@ -122,7 +134,7 @@ function Show-Usage {
 $name version $ScriptVersion
 
 Usage: $name [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-MacAddress]
-             [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
+             [-VpnIP] [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
              [-Version] [-Help]
 
 Displays IP address information for the network interface used to reach
@@ -132,12 +144,17 @@ With no switches, shows the routable IP, local LAN IP, subnet, default
 gateway, primary DNS server, MAC address and interface name. Value
 switches can be combined to show only those values.
 
+If the internet is reached through a VPN, the local details are those of
+the physical adapter the VPN runs over, followed by the VPN IP and VPN
+interface.
+
 Switches:
   -RoutableIP   Routable (public) IP only.  Aliases: -Routable, -Public
   -LocalIP      Local LAN IP only.          Aliases: -Local, -LAN
   -Gateway      Default gateway only.       Aliases: -GW
   -Dns          Primary DNS server only.    Aliases: -DnsServer
   -MacAddress   MAC address only.           Aliases: -Mac, -PhysicalAddress
+  -VpnIP        VPN IP only (exit code 1 if no VPN).  Aliases: -Vpn
   -AsText       Emit plain text instead of an object when piped/captured.
   -ApiUrl       Public IP lookup service URL (plain text or JSON {"ip":..}).
                 Default: $($defaultApiUrls[0])
@@ -158,6 +175,7 @@ Examples:
   $name -RoutableIP
   $name -LocalIP -Gateway
   $name -MacAddress
+  $name -VpnIP
   $name | Select-Object LocalIP, DefaultGateway
   $name -RoutableIP -AsText | Set-Clipboard
   $name > ipinfo.txt
@@ -340,10 +358,62 @@ function Get-NetworkPrefix {
     return New-Object System.Net.IPAddress (, $n)
 }
 
+# Returns the interface GUIDs of physical (hardware) network adapters, or
+# $null if they can't be determined.
+function Get-PhysicalAdapterIds {
+    try {
+        $adapters = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { -not $_.Virtual })
+        return @($adapters | ForEach-Object { ([string]$_.InterfaceGuid).ToUpperInvariant() })
+    } catch {
+        Write-Verbose "Could not list physical adapters: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-IPv4DefaultGateway {
+    param($Nic)
+    return $Nic.GetIPProperties().GatewayAddresses |
+        Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and -not $_.Address.Equals([System.Net.IPAddress]::Any) } |
+        Select-Object -First 1
+}
+
+# Picks the physical adapter that would carry traffic if the VPN were off:
+# the one with an IPv4 address and gateway and the lowest default route metric.
+function Get-PrimaryPhysicalAdapter {
+    param($Nics, [string[]]$PhysicalIds)
+
+    $candidates = @($Nics | Where-Object {
+            $PhysicalIds -contains $_.Id.ToUpperInvariant() -and
+            (Get-IPv4DefaultGateway $_) -and
+            ($_.GetIPProperties().UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' })
+        })
+    if ($candidates.Count -le 1) { return $candidates | Select-Object -First 1 }
+
+    $metrics = @{}
+    try {
+        Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | ForEach-Object {
+            $metric = $_.RouteMetric + $_.InterfaceMetric
+            if (-not $metrics.ContainsKey($_.ifIndex) -or $metric -lt $metrics[$_.ifIndex]) { $metrics[$_.ifIndex] = $metric }
+        }
+    } catch {
+        Write-Verbose "Could not read default routes: $($_.Exception.Message)"
+    }
+    return $candidates | Sort-Object {
+        $index = $_.GetIPProperties().GetIPv4Properties().Index
+        if ($metrics.ContainsKey($index)) { $metrics[$index] } else { [int]::MaxValue }
+    } | Select-Object -First 1
+}
+
+function Get-InterfaceName {
+    param($Nic)
+    if ($Nic.Description -and $Nic.Description -ne $Nic.Name) { return "$($Nic.Name) ($($Nic.Description))" }
+    return $Nic.Name
+}
+
 function Get-LocalNetworkInfo {
     param([string]$RouteHost)
 
-    $result = [ordered]@{ LocalIP = $null; Subnet = $null; DefaultGateway = $null; DnsServer = $null; MacAddress = $null; Interface = $null }
+    $result = [ordered]@{ LocalIP = $null; Subnet = $null; DefaultGateway = $null; DnsServer = $null; MacAddress = $null; Interface = $null; VpnIP = $null; VpnInterface = $null }
     $source = Get-SourceAddress -TargetHost $RouteHost
 
     $nics = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
@@ -360,14 +430,26 @@ function Get-LocalNetworkInfo {
     if (-not $nic) {
         # No route found: fall back to the first interface with an IPv4 gateway.
         Write-Verbose 'Falling back to first interface with an IPv4 default gateway'
-        $nic = $nics | Where-Object {
-            $_.GetIPProperties().GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and -not $_.Address.Equals([System.Net.IPAddress]::Any) }
-        } | Select-Object -First 1
+        $nic = $nics | Where-Object { Get-IPv4DefaultGateway $_ } | Select-Object -First 1
         if ($nic) {
             $unicast = $nic.GetIPProperties().UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
         }
     }
     if (-not $nic -or -not $unicast) { return $result }
+
+    # If the route goes through a virtual adapter (VPN), report the physical
+    # adapter underneath instead and keep the VPN details separately.
+    $physicalIds = Get-PhysicalAdapterIds
+    if ($physicalIds -and $physicalIds -notcontains $nic.Id.ToUpperInvariant()) {
+        $physical = Get-PrimaryPhysicalAdapter -Nics $nics -PhysicalIds $physicalIds
+        if ($physical) {
+            Write-Verbose "Route uses virtual adapter $($nic.Name); reporting physical adapter $($physical.Name)"
+            $result.VpnIP = $unicast.Address.ToString()
+            $result.VpnInterface = Get-InterfaceName $nic
+            $nic = $physical
+            $unicast = $nic.GetIPProperties().UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+        }
+    }
 
     $family = $unicast.Address.AddressFamily
     $props = $nic.GetIPProperties()
@@ -375,7 +457,7 @@ function Get-LocalNetworkInfo {
     $result.LocalIP = $unicast.Address.ToString()
     $macBytes = $nic.GetPhysicalAddress().GetAddressBytes()
     if ($macBytes.Length -gt 0) { $result.MacAddress = ($macBytes | ForEach-Object { $_.ToString('X2') }) -join '-' }
-    $result.Interface = if ($nic.Description -and $nic.Description -ne $nic.Name) { "$($nic.Name) ($($nic.Description))" } else { $nic.Name }
+    $result.Interface = Get-InterfaceName $nic
 
     $prefixLength = $null
     try { $prefixLength = $unicast.PrefixLength } catch { }
@@ -425,6 +507,7 @@ if ($LocalIP)    { $selected += 'LocalIP' }
 if ($Gateway)    { $selected += 'DefaultGateway' }
 if ($Dns)        { $selected += 'DnsServer' }
 if ($MacAddress) { $selected += 'MacAddress' }
+if ($VpnIP)      { $selected += 'VpnIP' }
 $showAll = $selected.Count -eq 0
 if ($showAll) { $selected = @($fields.Keys) }
 
@@ -448,6 +531,11 @@ if ($selected | Where-Object { $_ -ne 'RoutableIP' }) {
     $local = Get-LocalNetworkInfo -RouteHost $routeHost
     foreach ($key in $local.Keys) { $info[$key] = $local[$key] }
 }
+
+# In the full display, optional fields without a value are only kept in
+# object output. A switch that asks for one explicitly still reports it missing.
+$objectFields = $selected
+if ($showAll) { $selected = @($selected | Where-Object { $info[$_] -or -not $fields[$_].Optional }) }
 
 $missing = @($selected | Where-Object { -not $info[$_] })
 $labelWidth = ($selected | ForEach-Object { $fields[$_].Label.Length } | Measure-Object -Maximum).Maximum
@@ -495,7 +583,7 @@ switch ($mode) {
     }
     'Object' {
         $out = [ordered]@{}
-        foreach ($key in $selected) { $out[$key] = $info[$key] }
+        foreach ($key in $objectFields) { $out[$key] = $info[$key] }
         [pscustomobject]$out
     }
 }

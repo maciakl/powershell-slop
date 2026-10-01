@@ -9,6 +9,7 @@ A single-file PowerShell script that shows IP address information for the networ
 - Primary DNS server
 - MAC address
 - Interface name
+- VPN IP and VPN interface (only when a VPN is in use)
 
 It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no external dependencies.
 
@@ -16,7 +17,7 @@ It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no exte
 
 ```powershell
 .\Get-Ip.ps1 [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-MacAddress]
-             [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
+             [-VpnIP] [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
              [-Version] [-Help]
 ```
 
@@ -27,13 +28,14 @@ It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no exte
 | `-Gateway`    | `-GW`                    | Default gateway only |
 | `-Dns`        | `-DnsServer`             | Primary DNS server only |
 | `-MacAddress` | `-Mac`, `-PhysicalAddress` | MAC address only |
+| `-VpnIP`      | `-Vpn`                   | VPN IP only (exit code `1` if no VPN is in use) |
 | `-AsText`     |                          | Emit plain text instead of an object when piped or captured |
 | `-ApiUrl`     | `-Url`, `-Api`           | Use your own routable IP lookup service |
 | `-TimeoutSec` |                          | Timeout for the routable IP lookup (default `10`) |
 | `-Version`    |                          | Show the script version |
 | `-Help`       | `-h`                     | Show usage |
 
-The `-RoutableIP`, `-LocalIP`, `-Gateway`, `-Dns` and `-MacAddress` switches can be combined. They output the address only, with no label, one per line in the order listed above.
+The `-RoutableIP`, `-LocalIP`, `-Gateway`, `-Dns`, `-MacAddress` and `-VpnIP` switches can be combined. They output the address only, with no label, one per line in the order listed above.
 
 `Get-Help .\Get-Ip.ps1 -Full` also works.
 
@@ -60,7 +62,14 @@ MAC Address     : 00-1A-2B-3C-4D-5E
 Interface       : Ethernet (Intel(R) Ethernet Controller)
 ```
 
-The object has the properties `RoutableIP`, `LocalIP`, `Subnet`, `DefaultGateway`, `DnsServer`, `MacAddress` and `Interface`. With value switches, only the selected properties are included.
+When a VPN is in use, two more lines follow:
+
+```
+VPN IP          : 100.64.0.5
+VPN Interface   : Tailscale (Tailscale Tunnel)
+```
+
+The object has the properties `RoutableIP`, `LocalIP`, `Subnet`, `DefaultGateway`, `DnsServer`, `MacAddress`, `Interface`, `VpnIP` and `VpnInterface`. The VPN properties are `$null` when no VPN is in use. With value switches, only the selected properties are included.
 
 ## Examples
 
@@ -76,6 +85,9 @@ The object has the properties `RoutableIP`, `LocalIP`, `Subnet`, `DefaultGateway
 
 # Just the MAC address
 .\Get-Ip.ps1 -MacAddress
+
+# Just the VPN IP, or exit code 1 if no VPN is in use
+.\Get-Ip.ps1 -VpnIP
 
 # Script version
 .\Get-Ip.ps1 -Version
@@ -97,7 +109,7 @@ $gw = (.\Get-Ip.ps1 -Gateway).DefaultGateway
 ## How it works
 
 - **Routable IP**: queried from `https://api.ipify.org`. If that fails, the script falls back to `https://checkip.amazonaws.com` and then `https://ipv4.icanhazip.com`. A URL given with `-ApiUrl` is used on its own, with no fallback. The service may return plain text or JSON with an `ip` property.
-- **Interface selection**: the script asks Windows which local address it would use to reach the lookup host (a UDP socket "connect", which sends no packets). The subnet, gateway, DNS server and MAC address come from that same interface. If you're on a VPN, that's the VPN interface. If no route is available, it falls back to the first active interface with an IPv4 default gateway.
+- **Interface selection**: the script asks Windows which local address it would use to reach the lookup host (a UDP socket "connect", which sends no packets). The subnet, gateway, DNS server and MAC address come from that same interface. If that turns out to be a virtual adapter (a VPN), the script reports the physical adapter underneath it instead: the hardware adapter with an IPv4 address and default gateway and the lowest default route metric. The VPN's own address and adapter are shown as `VPN IP` and `VPN Interface`. If no physical adapter qualifies (for example, a Hyper-V external switch), the virtual adapter is reported as before. If no route is available, it falls back to the first active interface with an IPv4 default gateway.
 - **Output detection**: PowerShell doesn't tell a script when its output is redirected with `>`, so the script parses the command line it was invoked from to see whether its output is piped, captured or redirected.
 
 ## Exit codes
@@ -105,7 +117,7 @@ $gw = (.\Get-Ip.ps1 -Gateway).DefaultGateway
 | Code | Meaning |
 |------|---------|
 | `0`  | Success |
-| `1`  | One or more requested values could not be determined |
+| `1`  | One or more requested values could not be determined (including `-VpnIP` when no VPN is in use) |
 | `2`  | Invalid `-ApiUrl` |
 
 ## Notes
