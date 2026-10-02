@@ -12,9 +12,11 @@
       * Piped / captured   -> PowerShell object (use -AsText for plain text)
       * Redirected to file -> plain text (">", "| Out-File", "| Set-Content",
                               "| Add-Content", or stdout redirected from cmd)
+    Use -AsObject to always get a PowerShell object, wherever output goes.
 
-    The -RoutableIP, -LocalIP, -Gateway, -Dns, -MacAddress and -VpnIP switches output only the
-    address(es), with no labels, one per line in that order. Piped output is
+    The -RoutableIP, -LocalIP, -Gateway, -Dns, -MacAddress and -VpnIP
+    switches output only the address(es), with no labels, one per line in
+    that order. Piped output is
     still an object unless -AsText is used.
 
     Requires only Windows PowerShell 5.1 as shipped with Windows 11.
@@ -41,6 +43,10 @@
 .PARAMETER AsText
     When piped or captured, emit plain text instead of a PowerShell object.
 
+.PARAMETER AsObject
+    Always emit a PowerShell object, even when output goes to the console or
+    a file. Cannot be combined with -AsText.
+
 .PARAMETER ApiUrl
     URL of a service that returns the caller's public IP address, either as
     plain text or as JSON with an "ip" property. Default: https://api.ipify.org
@@ -55,7 +61,7 @@
     Show usage information.
 
 .NOTES
-    Version: 1.3.0
+    Version: 1.4.0
 
 .EXAMPLE
     .\Get-Ip.ps1
@@ -91,6 +97,8 @@ param(
 
     [switch]$AsText,
 
+    [switch]$AsObject,
+
     [Alias('Url', 'Api')]
     [string]$ApiUrl,
 
@@ -106,7 +114,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.4.0'
 $scriptInvocation = $MyInvocation
 $defaultApiUrls = @(
     'https://api.ipify.org'
@@ -134,8 +142,8 @@ function Show-Usage {
 $name version $ScriptVersion
 
 Usage: $name [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-MacAddress]
-             [-VpnIP] [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
-             [-Version] [-Help]
+             [-VpnIP] [-AsText | -AsObject] [-ApiUrl <url>]
+             [-TimeoutSec <seconds>] [-Version] [-Help]
 
 Displays IP address information for the network interface used to reach
 the internet.
@@ -156,6 +164,7 @@ Switches:
   -MacAddress   MAC address only.           Aliases: -Mac, -PhysicalAddress
   -VpnIP        VPN IP only (exit code 1 if no VPN).  Aliases: -Vpn
   -AsText       Emit plain text instead of an object when piped/captured.
+  -AsObject     Always emit a PowerShell object, wherever output goes.
   -ApiUrl       Public IP lookup service URL (plain text or JSON {"ip":..}).
                 Default: $($defaultApiUrls[0])
                 (falls back to $($defaultApiUrls[1..($defaultApiUrls.Count - 1)] -join ', '))
@@ -167,6 +176,7 @@ Output:
   Console            Colorized display.
   Piped / captured   PowerShell object (plain text with -AsText).
   Redirected to file Plain text.
+  -AsObject          PowerShell object, always.
 
   Value switches print the bare address(es) only, one per line.
 
@@ -178,6 +188,7 @@ Examples:
   $name -VpnIP
   $name | Select-Object LocalIP, DefaultGateway
   $name -RoutableIP -AsText | Set-Clipboard
+  $name -AsObject
   $name > ipinfo.txt
   $name -ApiUrl https://ifconfig.me/ip
 "@
@@ -497,7 +508,12 @@ if ($Version) {
     return
 }
 
-$mode = Get-OutputMode -Invocation $scriptInvocation
+if ($AsText -and $AsObject) {
+    Write-Error '-AsText and -AsObject cannot be used together.' -ErrorAction Continue
+    exit 2
+}
+
+$mode = if ($AsObject) { 'Object' } else { Get-OutputMode -Invocation $scriptInvocation }
 if ($mode -eq 'Object' -and $AsText) { $mode = 'Text' }
 Write-Verbose "Output mode: $mode"
 

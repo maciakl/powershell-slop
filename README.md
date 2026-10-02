@@ -17,8 +17,8 @@ It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no exte
 
 ```powershell
 .\Get-Ip.ps1 [-RoutableIP] [-LocalIP] [-Gateway] [-Dns] [-MacAddress]
-             [-VpnIP] [-AsText] [-ApiUrl <url>] [-TimeoutSec <seconds>]
-             [-Version] [-Help]
+             [-VpnIP] [-AsText | -AsObject] [-ApiUrl <url>]
+             [-TimeoutSec <seconds>] [-Version] [-Help]
 ```
 
 | Switch        | Aliases                  | Description |
@@ -30,6 +30,7 @@ It runs on the Windows PowerShell 5.1 that ships with Windows 11 and has no exte
 | `-MacAddress` | `-Mac`, `-PhysicalAddress` | MAC address only |
 | `-VpnIP`      | `-Vpn`                   | VPN IP only (exit code `1` if no VPN is in use) |
 | `-AsText`     |                          | Emit plain text instead of an object when piped or captured |
+| `-AsObject`   |                          | Always emit a PowerShell object, even to the console or a file |
 | `-ApiUrl`     | `-Url`, `-Api`           | Use your own routable IP lookup service |
 | `-TimeoutSec` |                          | Timeout for the routable IP lookup (default `10`) |
 | `-Version`    |                          | Show the script version |
@@ -49,6 +50,8 @@ The output adapts to where it is going:
 | Piped or captured (`\| ...`, `$x = ...`, `(...).Prop`) | PowerShell object (plain text with `-AsText`) |
 | Redirected to a file (`>`, `*>`, `\| Out-File`, `\| Set-Content`, `\| Add-Content`) | Plain text |
 | Run from `cmd.exe` with stdout redirected (`powershell -File Get-Ip.ps1 > out.txt`) | Plain text |
+
+`-AsObject` overrides all of the above and always returns a PowerShell object. `-AsText` and `-AsObject` can't be used together.
 
 Without switches, plain text output uses `Label : value` lines:
 
@@ -99,6 +102,9 @@ $gw = (.\Get-Ip.ps1 -Gateway).DefaultGateway
 # Copy the public IP to the clipboard as text
 .\Get-Ip.ps1 -RoutableIP -AsText | Set-Clipboard
 
+# Always get an object, even at the console
+.\Get-Ip.ps1 -AsObject
+
 # Save to a file
 .\Get-Ip.ps1 > ipinfo.txt
 
@@ -118,7 +124,7 @@ $gw = (.\Get-Ip.ps1 -Gateway).DefaultGateway
 |------|---------|
 | `0`  | Success |
 | `1`  | One or more requested values could not be determined (including `-VpnIP` when no VPN is in use) |
-| `2`  | Invalid `-ApiUrl` |
+| `2`  | Invalid `-ApiUrl`, or `-AsText` used with `-AsObject` |
 
 ## Notes
 
