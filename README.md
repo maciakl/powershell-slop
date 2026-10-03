@@ -1,10 +1,12 @@
 # ClipboardMgr
 
 A compact, colorized clipboard manager TUI in a single PowerShell file. Runs on the
-Windows PowerShell 5.1 that ships with Windows 11, with no external dependencies.
+Windows PowerShell 5.1 that ships with Windows 11, and on PowerShell 7, with no external
+dependencies.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\ClipboardMgr.ps1
+powershell -ExecutionPolicy Bypass -File .\ClipboardMgr.ps1   # Windows PowerShell 5.1
+pwsh -File .\ClipboardMgr.ps1                                  # PowerShell 7
 ```
 
 ## What it shows

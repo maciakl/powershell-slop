@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    ClipboardMgr - a compact, colorized clipboard manager TUI for Windows PowerShell 5.1.
+    ClipboardMgr - a compact, colorized clipboard manager TUI for Windows PowerShell 5.1 and PowerShell 7.
 
 .DESCRIPTION
     Shows the current clipboard and, when Windows clipboard history (Win+V) is enabled, the
@@ -10,8 +10,8 @@
     Entries can be browsed with the keyboard, copied back to the clipboard, pasted into the
     previous window, viewed, edited (text), saved (images/binary) and deleted.
 
-    No external dependencies: uses only .NET Framework, WinRT projections and Win32 APIs that
-    ship with Windows 11.
+    No external dependencies: uses only .NET, Windows Forms and Windows APIs that ship with
+    Windows 11. Works in Windows PowerShell 5.1 and PowerShell 7.
 
 .NOTES
     Keys (press ? inside the app for the full list):
@@ -439,70 +439,269 @@ function Get-CurrentClipboardEntry {
 # ---------------------------------------------------------------------------------------------
 # Windows clipboard history (WinRT)
 # ---------------------------------------------------------------------------------------------
-$WinRT = @{ AsTask = $null; Clipboard = $null }
+# Windows PowerShell 5.1 can project WinRT types, but PowerShell 7 (.NET 5+) cannot. To work on
+# both, the few WinRT calls we need go straight through the COM ABI: activation factory, vtable
+# slots and HSTRINGs from combase.dll. Slot numbers come from the interfaces' metadata order
+# (0-2 IUnknown, 3-5 IInspectable, then the interface's own methods). Kept to C# 5 so that the
+# .NET Framework compiler used by Windows PowerShell 5.1 accepts it.
+if (-not ('ClipMgr.History' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace ClipMgr {
+    internal static class Rt {
+        [DllImport("combase.dll")] internal static extern int WindowsCreateString([MarshalAs(UnmanagedType.LPWStr)] string s, uint len, out IntPtr h);
+        [DllImport("combase.dll")] internal static extern int WindowsDeleteString(IntPtr h);
+        [DllImport("combase.dll")] internal static extern IntPtr WindowsGetStringRawBuffer(IntPtr h, out uint len);
+        [DllImport("combase.dll")] internal static extern int RoGetActivationFactory(IntPtr classId, ref Guid iid, out IntPtr factory);
+        [DllImport("shcore.dll")] internal static extern int CreateStreamOverRandomAccessStream(IntPtr ras, ref Guid riid, out IntPtr ppv);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int OutPtr(IntPtr self, out IntPtr r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int OutInt(IntPtr self, out int r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int OutUInt(IntPtr self, out uint r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int OutLong(IntPtr self, out long r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int OutByte(IntPtr self, out byte r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int PtrOutByte(IntPtr self, IntPtr a, out byte r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int PtrOutInt(IntPtr self, IntPtr a, out int r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int UIntOutPtr(IntPtr self, uint i, out IntPtr r);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int ReadFn(IntPtr self, [Out] byte[] buf, uint cb, out uint read);
+
+        internal static readonly Guid IID_IAsyncInfo = new Guid("00000036-0000-0000-C000-000000000046");
+        internal static readonly Guid IID_IStream = new Guid("0000000C-0000-0000-C000-000000000046");
+        internal static readonly Guid IID_IRandomAccessStream = new Guid("905a0fe1-bc53-11df-8c49-001e4fc686da");
+        internal static readonly Guid IID_IContentTypeProvider = new Guid("97d098a5-3b99-4de9-88a5-e11d2f50c795");
+
+        internal static T Fn<T>(IntPtr obj, int slot) where T : class {
+            IntPtr vtbl = Marshal.ReadIntPtr(obj);
+            IntPtr fp = Marshal.ReadIntPtr(vtbl, slot * IntPtr.Size);
+            return Marshal.GetDelegateForFunctionPointer(fp, typeof(T)) as T;
+        }
+        internal static void Check(int hr) { if (hr < 0) Marshal.ThrowExceptionForHR(hr); }
+        internal static void Release(IntPtr p) { if (p != IntPtr.Zero) Marshal.Release(p); }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int QIFn(IntPtr self, ref Guid iid, out IntPtr r);
+        internal static IntPtr QI(IntPtr p, Guid iid) {
+            IntPtr r;
+            Check(Fn<QIFn>(p, 0)(p, ref iid, out r));                  // IUnknown.QueryInterface
+            return r;
+        }
+
+        // Takes ownership of an HSTRING and returns its contents.
+        internal static string TakeString(IntPtr h) {
+            if (h == IntPtr.Zero) return "";
+            uint len;
+            IntPtr buf = WindowsGetStringRawBuffer(h, out len);
+            string s = Marshal.PtrToStringUni(buf, (int)len);
+            WindowsDeleteString(h);
+            return s;
+        }
+
+        // Waits for an IAsyncOperation<T> whose T is a pointer or HSTRING, releases the operation
+        // and returns the result.
+        internal static IntPtr Await(IntPtr op, int timeoutMs) {
+            IntPtr info = QI(op, IID_IAsyncInfo);
+            try {
+                DateTime until = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                while (true) {
+                    int status;
+                    Check(Fn<OutInt>(info, 7)(info, out status));      // IAsyncInfo.Status
+                    if (status == 1) break;                             // Completed
+                    if (status == 2) throw new OperationCanceledException();
+                    if (status == 3) {                                  // Error
+                        int err;
+                        Check(Fn<OutInt>(info, 8)(info, out err));
+                        Marshal.ThrowExceptionForHR(err);
+                    }
+                    if (DateTime.UtcNow > until) throw new TimeoutException("WinRT call timed out");
+                    System.Threading.Thread.Sleep(2);
+                }
+                IntPtr result;
+                Check(Fn<OutPtr>(op, 8)(op, out result));               // IAsyncOperation<T>.GetResults
+                return result;
+            }
+            finally { Release(info); Release(op); }
+        }
+
+        internal static string[] VectorOfStrings(IntPtr vec) {
+            uint n;
+            Check(Fn<OutUInt>(vec, 7)(vec, out n));                     // IVectorView.Size
+            string[] r = new string[n];
+            for (uint i = 0; i < n; i++) {
+                IntPtr h;
+                Check(Fn<UIntOutPtr>(vec, 6)(vec, i, out h));          // IVectorView.GetAt
+                r[i] = TakeString(h);
+            }
+            return r;
+        }
+    }
+
+    public class HistoryItem {
+        internal IntPtr Ptr;    // IClipboardHistoryItem
+        IntPtr view;            // IDataPackageView
+        public string Id;
+        public DateTime Timestamp;
+        public string[] Formats;
+
+        internal HistoryItem(IntPtr item) {
+            Ptr = item;
+            IntPtr h;
+            Rt.Check(Rt.Fn<Rt.OutPtr>(item, 6)(item, out h));         // Id
+            Id = Rt.TakeString(h);
+            long ticks;
+            Rt.Check(Rt.Fn<Rt.OutLong>(item, 7)(item, out ticks));    // Timestamp (FILETIME units)
+            Timestamp = DateTime.FromFileTimeUtc(ticks).ToLocalTime();
+            Rt.Check(Rt.Fn<Rt.OutPtr>(item, 8)(item, out view));      // Content
+            IntPtr vec;
+            Rt.Check(Rt.Fn<Rt.OutPtr>(view, 9)(view, out vec));      // AvailableFormats
+            try { Formats = Rt.VectorOfStrings(vec); } finally { Rt.Release(vec); }
+        }
+
+        ~HistoryItem() { Rt.Release(view); Rt.Release(Ptr); }
+
+        string GetString(int slot) {
+            IntPtr op;
+            Rt.Check(Rt.Fn<Rt.OutPtr>(view, slot)(view, out op));
+            return Rt.TakeString(Rt.Await(op, 5000));
+        }
+        public string GetText() { return GetString(12); }      // GetTextAsync()
+        public string GetHtml() { return GetString(15); }      // GetHtmlFormatAsync()
+        public string GetRtf() { return GetString(17); }       // GetRtfAsync()
+
+        // Reads the stored bitmap: up to maxBytes (0 = all), plus its total size and content type.
+        public byte[] ReadBitmap(int maxBytes, out long size, out string contentType) {
+            IntPtr op, reference = IntPtr.Zero, stream = IntPtr.Zero, ras = IntPtr.Zero, ctp = IntPtr.Zero, istream = IntPtr.Zero;
+            try {
+                Rt.Check(Rt.Fn<Rt.OutPtr>(view, 18)(view, out op));                 // GetBitmapAsync
+                reference = Rt.Await(op, 5000);
+                Rt.Check(Rt.Fn<Rt.OutPtr>(reference, 6)(reference, out op));       // OpenReadAsync
+                stream = Rt.Await(op, 5000);
+                ras = Rt.QI(stream, Rt.IID_IRandomAccessStream);
+                Rt.Check(Rt.Fn<Rt.OutLong>(ras, 6)(ras, out size));                  // Size
+                ctp = Rt.QI(stream, Rt.IID_IContentTypeProvider);
+                IntPtr h;
+                Rt.Check(Rt.Fn<Rt.OutPtr>(ctp, 6)(ctp, out h));                       // ContentType
+                contentType = Rt.TakeString(h);
+                Guid iid = Rt.IID_IStream;
+                Rt.Check(Rt.CreateStreamOverRandomAccessStream(stream, ref iid, out istream));
+                long want = (maxBytes > 0) ? Math.Min((long)maxBytes, size) : size;
+                byte[] result = new byte[want];
+                byte[] chunk = new byte[65536];
+                long got = 0;
+                Rt.ReadFn read = Rt.Fn<Rt.ReadFn>(istream, 3);                       // ISequentialStream.Read
+                while (got < want) {
+                    uint n;
+                    int hr = read(istream, chunk, (uint)Math.Min(chunk.Length, want - got), out n);
+                    Rt.Check(hr);
+                    if (n == 0) break;
+                    Array.Copy(chunk, 0, result, got, n);
+                    got += n;
+                }
+                if (got < want) Array.Resize(ref result, (int)got);
+                return result;
+            }
+            finally { Rt.Release(istream); Rt.Release(ctp); Rt.Release(ras); Rt.Release(stream); Rt.Release(reference); }
+        }
+    }
+
+    public static class History {
+        static IntPtr statics;   // IClipboardStatics2
+
+        public static void Init() {
+            if (statics != IntPtr.Zero) return;
+            const string cls = "Windows.ApplicationModel.DataTransfer.Clipboard";
+            IntPtr h;
+            Rt.Check(Rt.WindowsCreateString(cls, (uint)cls.Length, out h));
+            try {
+                Guid iid = new Guid("d2ac1b6a-d29f-554b-b303-f0452345fe02");
+                Rt.Check(Rt.RoGetActivationFactory(h, ref iid, out statics));
+            }
+            finally { Rt.WindowsDeleteString(h); }
+        }
+
+        public static bool IsEnabled() {
+            byte b;
+            Rt.Check(Rt.Fn<Rt.OutByte>(statics, 10)(statics, out b));
+            return b != 0;
+        }
+
+        // status: 0 = Success, 1 = AccessDenied, 2 = ClipboardHistoryDisabled
+        public static HistoryItem[] GetItems(out int status) {
+            IntPtr op;
+            Rt.Check(Rt.Fn<Rt.OutPtr>(statics, 6)(statics, out op));               // GetHistoryItemsAsync
+            IntPtr res = Rt.Await(op, 5000);
+            List<HistoryItem> list = new List<HistoryItem>();
+            IntPtr vec = IntPtr.Zero;
+            try {
+                Rt.Check(Rt.Fn<Rt.OutInt>(res, 6)(res, out status));               // Status
+                if (status != 0) return list.ToArray();
+                Rt.Check(Rt.Fn<Rt.OutPtr>(res, 7)(res, out vec));                  // Items
+                uint n;
+                Rt.Check(Rt.Fn<Rt.OutUInt>(vec, 7)(vec, out n));
+                for (uint i = 0; i < n; i++) {
+                    IntPtr item;
+                    Rt.Check(Rt.Fn<Rt.UIntOutPtr>(vec, 6)(vec, i, out item));
+                    list.Add(new HistoryItem(item));
+                }
+                return list.ToArray();
+            }
+            finally { Rt.Release(vec); Rt.Release(res); }
+        }
+
+        public static bool Clear() {
+            byte b;
+            Rt.Check(Rt.Fn<Rt.OutByte>(statics, 7)(statics, out b));
+            return b != 0;
+        }
+
+        public static bool Delete(HistoryItem item) {
+            byte b;
+            Rt.Check(Rt.Fn<Rt.PtrOutByte>(statics, 8)(statics, item.Ptr, out b));
+            return b != 0;
+        }
+
+        // 0 = Success, 1 = AccessDenied, 2 = ItemDeleted
+        public static int SetAsContent(HistoryItem item) {
+            int r;
+            Rt.Check(Rt.Fn<Rt.PtrOutInt>(statics, 9)(statics, item.Ptr, out r));
+            return r;
+        }
+    }
+}
+'@
+}
 
 function Initialize-History {
     if ($SessionOnly) { $S.HistoryState = 'disabled (-SessionOnly)'; return }
-    if ($PSVersionTable.PSVersion.Major -gt 5) { $S.HistoryState = 'n/a (needs Windows PowerShell 5.1)'; return }
     try {
-        Add-Type -AssemblyName System.Runtime.WindowsRuntime
-        $WinRT.Clipboard = [Windows.ApplicationModel.DataTransfer.Clipboard, Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
-        $null = [Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult, Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
-        $null = [Windows.Storage.IStorageItem, Windows.Storage, ContentType = WindowsRuntime]
-        $null = [Windows.Storage.Streams.RandomAccessStreamReference, Windows.Storage.Streams, ContentType = WindowsRuntime]
-        $WinRT.AsTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-        } | Select-Object -First 1
-        if (-not $WinRT.Clipboard::IsHistoryEnabled()) {
-            $S.HistoryState = 'off (Settings > System > Clipboard)'; return
-        }
+        [ClipMgr.History]::Init()
+        if (-not [ClipMgr.History]::IsEnabled()) { $S.HistoryState = 'off (Settings > System > Clipboard)'; return }
         $S.HistoryOk = $true; $S.HistoryState = 'on'
     }
     catch { $S.HistoryState = 'unavailable'; $S.HistoryOk = $false }
 }
 
-function Wait-WinRT($op, [type]$type, [int]$timeout = 4000) {
-    $task = $WinRT.AsTask.MakeGenericMethod($type).Invoke($null, @($op))
-    if (-not $task.Wait($timeout)) { throw 'WinRT call timed out' }
-    return $task.Result
-}
-
-function Open-HistoryBitmap($item) {
-    # PowerShell only sees the returned stream as a bare __ComObject, so its interface members
-    # are reached through reflection (the CLR then does the COM QueryInterface for us).
-    $ref = Wait-WinRT ($item.Content.GetBitmapAsync()) ([Windows.Storage.Streams.RandomAccessStreamReference])
-    $rs = Wait-WinRT ($ref.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
-    $size = [Windows.Storage.Streams.IRandomAccessStream].GetProperty('Size').GetValue($rs)
-    $ct = [Windows.Storage.Streams.IContentTypeProvider].GetProperty('ContentType').GetValue($rs)
-    $asStream = [System.IO.WindowsRuntimeStreamExtensions].GetMethod('AsStreamForRead', [type[]]@([Windows.Storage.Streams.IInputStream]))
-    return @{ Size = [long]$size; ContentType = $ct; Stream = $asStream.Invoke($null, @($rs)) }
+function Read-HistoryBitmap($item, [int]$maxBytes) {
+    $size = [long]0; $ct = ''
+    $bytes = $item.ReadBitmap($maxBytes, [ref]$size, [ref]$ct)
+    return @{ Bytes = $bytes; Size = $size; ContentType = $ct }
 }
 
 function ConvertFrom-HistoryItem($item) {
-    $view = $item.Content
-    $formats = @($view.AvailableFormats)
+    $formats = @($item.Formats)
     $e = $null
     if ($formats -contains 'Text') {
         $e = New-Entry 'Text' 'History'
-        $e.Text = Wait-WinRT ($view.GetTextAsync()) ([string])
-    }
-    elseif ($formats -contains 'Shell IDList Array' -or $formats -contains 'StorageItems') {
-        $e = New-Entry 'Files' 'History'
-        try {
-            $items = Wait-WinRT ($view.GetStorageItemsAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Storage.IStorageItem]])
-            $e.Files = [string[]]@($items | ForEach-Object { $_.Path })
-        }
-        catch { $e.Files = @() }
+        $e.Text = $item.GetText()
     }
     elseif ($formats -contains 'Bitmap') {
         $e = New-Entry 'Image' 'History'
         try {
-            $bmp = Open-HistoryBitmap $item
-            $head = Read-StreamHead $bmp.Stream 4096
-            $bmp.Stream.Dispose()
+            $bmp = Read-HistoryBitmap $item 4096
             $e.BinSize = $bmp.Size
-            $e.BinType = Get-BlobType $head
-            $e.BinData = $head    # header only; the full image is fetched on demand
+            $e.BinType = Get-BlobType $bmp.Bytes
+            $e.BinData = $bmp.Bytes    # header only; the full image is fetched on demand
             $e.BinFormat = if ($bmp.ContentType) { $bmp.ContentType } else { 'Bitmap' }
             $fmtName = ($e.BinType -split ' ')[0]
             if ($e.BinType -match '(\d+) x (\d+)') {
@@ -516,11 +715,11 @@ function ConvertFrom-HistoryItem($item) {
     }
     elseif ($formats -contains 'HTML Format') {
         $e = New-Entry 'Text' 'History'
-        $e.Text = Wait-WinRT ($view.GetHtmlFormatAsync()) ([string])
+        $e.Text = $item.GetHtml()
     }
     elseif ($formats -contains 'Rich Text Format') {
         $e = New-Entry 'Text' 'History'
-        $e.Text = Wait-WinRT ($view.GetRtfAsync()) ([string])
+        $e.Text = $item.GetRtf()
     }
     else {
         $e = New-Entry 'Binary' 'History'
@@ -529,7 +728,7 @@ function ConvertFrom-HistoryItem($item) {
     }
     $e.HistoryItem = $item
     $e.Formats = $formats
-    $e.Time = $item.Timestamp.LocalDateTime
+    $e.Time = $item.Timestamp
     Update-EntrySummary $e
     return $e
 }
@@ -537,12 +736,16 @@ function ConvertFrom-HistoryItem($item) {
 function Get-HistoryEntries {
     if (-not $S.HistoryOk) { return @() }
     try {
-        $res = Wait-WinRT ($WinRT.Clipboard::GetHistoryItemsAsync()) ([Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult])
-        if ("$($res.Status)" -ne 'Success') { $S.HistoryState = "error: $($res.Status)"; return @() }
+        $status = 0
+        $items = [ClipMgr.History]::GetItems([ref]$status)
+        if ($status -ne 0) {
+            $S.HistoryState = switch ($status) { 1 { 'access denied' } 2 { 'off (Settings > System > Clipboard)' } default { "error $status" } }
+            return @()
+        }
         $S.HistoryState = 'on'
         $list = New-Object System.Collections.ArrayList
         $seen = @{}
-        foreach ($item in @($res.Items)) {
+        foreach ($item in $items) {
             $seen[$item.Id] = $true
             $e = $S.HistoryCache[$item.Id]
             if (-not $e) {
@@ -1203,9 +1406,10 @@ function Get-Selected { if ($S.Entries.Count -gt 0) { return $S.Entries[$S.Sel] 
 function Set-ClipboardFromEntry($e) {
     if (-not $e -or $e.Kind -eq 'Empty') { return $false }
     if ($e.HistoryItem) {
-        $st = $WinRT.Clipboard::SetHistoryItemAsContent($e.HistoryItem)
-        if ("$st" -eq 'Success') { return $true }
-        if ($e.Kind -ne 'Text') { Set-Message "Windows refused to restore the item: $st" 'err'; return $false }
+        $st = [ClipMgr.History]::SetAsContent($e.HistoryItem)
+        if ($st -eq 0) { return $true }
+        $why = switch ($st) { 1 { 'access denied' } 2 { 'item was deleted' } default { "status $st" } }
+        if ($e.Kind -ne 'Text') { Set-Message "Windows refused to restore the item: $why" 'err'; return $false }
     }
     switch ($e.Kind) {
         'Text' { Invoke-Clipboard { [System.Windows.Forms.Clipboard]::SetText($e.Text) } }
@@ -1306,7 +1510,7 @@ function Invoke-Delete {
     if (-not $e -or $e.Kind -eq 'Empty') { return }
     try {
         if ($e.HistoryItem) {
-            if (-not $WinRT.Clipboard::DeleteItemFromHistory($e.HistoryItem)) { Set-Message 'Windows refused to delete the item.' 'err'; return }
+            if (-not [ClipMgr.History]::Delete($e.HistoryItem)) { Set-Message 'Windows refused to delete the item.' 'err'; return }
             $S.HistoryCache.Remove($e.HistoryItem.Id)
         }
         foreach ($d in @($S.Session | Where-Object { $_.Sig -eq $e.Sig })) { $S.Session.Remove($d) }
@@ -1325,7 +1529,7 @@ function Invoke-Delete {
 function Invoke-ClearAll {
     if (-not (Confirm-Action 'Clear the clipboard, Windows clipboard history (except pinned) and session history?')) { return }
     try {
-        if ($S.HistoryOk) { [void]$WinRT.Clipboard::ClearHistory() }
+        if ($S.HistoryOk) { [void][ClipMgr.History]::Clear() }
         $S.Session.Clear(); $S.HistoryCache.Clear()
         Invoke-Clipboard { [System.Windows.Forms.Clipboard]::Clear() }
         Set-Message 'Clipboard and history cleared.' 'ok'
@@ -1347,7 +1551,7 @@ function Invoke-View {
     elseif ($e.Kind -eq 'Image') {
         $data = $e.BinData
         try {
-            if ($e.HistoryItem) { $bmp = Open-HistoryBitmap $e.HistoryItem; $data = Read-StreamHead $bmp.Stream 1024; $bmp.Stream.Dispose() }
+            if ($e.HistoryItem) { $data = (Read-HistoryBitmap $e.HistoryItem 1024).Bytes }
             elseif (-not $data -and $e.Image) {
                 $ms = New-Object IO.MemoryStream; $e.Image.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); $data = $ms.ToArray()
             }
@@ -1382,7 +1586,7 @@ function Invoke-Edit([switch]$External) {
         # Replace: the edited text becomes the current clipboard and the original entry goes away.
         if ($new.Length -gt 0) { Invoke-Clipboard { [System.Windows.Forms.Clipboard]::SetText($new) } }
         else { Invoke-Clipboard { [System.Windows.Forms.Clipboard]::Clear() } }
-        if ($e.HistoryItem) { [void]$WinRT.Clipboard::DeleteItemFromHistory($e.HistoryItem); $S.HistoryCache.Remove($e.HistoryItem.Id) }
+        if ($e.HistoryItem) { [void][ClipMgr.History]::Delete($e.HistoryItem); $S.HistoryCache.Remove($e.HistoryItem.Id) }
         foreach ($d in @($S.Session | Where-Object { $_.Sig -eq $e.Sig })) { $S.Session.Remove($d) }
         Set-Message 'Edited text copied to the clipboard.' 'ok'
         $S.Sel = 0
@@ -1428,9 +1632,7 @@ function Invoke-Save {
                 }
                 elseif ($e.HistoryItem) {
                     # Windows history gives us the stored bytes; written as-is.
-                    $bmp = Open-HistoryBitmap $e.HistoryItem
-                    $fs = [IO.File]::Create($path)
-                    try { $bmp.Stream.CopyTo($fs) } finally { $fs.Dispose(); $bmp.Stream.Dispose() }
+                    [IO.File]::WriteAllBytes($path, (Read-HistoryBitmap $e.HistoryItem 0).Bytes)
                 }
             }
             default { [IO.File]::WriteAllBytes($path, $e.BinData) }
