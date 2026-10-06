@@ -4,27 +4,29 @@
 source := "D:/code/powershell"
 
 # Add every sub-folder of {{source}} that is not yet a subtree
+[script("pwsh", "-NoProfile")]
 add:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for dir in "{{source}}"/*/; do
-        name=$(basename "$dir")
-        if git log -1 --format=%H --grep="^git-subtree-dir: $name\$" | grep -q .; then
-            echo "skip: $name (already a subtree)"
+    $ErrorActionPreference = 'Stop'
+    $PSNativeCommandUseErrorActionPreference = $true
+    foreach ($dir in Get-ChildItem -Directory '{{source}}') {
+        $name = $dir.Name
+        if (git log -1 --format=%H --grep="^git-subtree-dir: $name`$") {
+            Write-Host "skip: $name (already a subtree)"
             continue
-        fi
-        branch=$(git -C "$dir" branch --show-current)
-        echo "add: $name ($branch)"
-        git subtree add --prefix="$name" "$dir" "$branch"
-    done
+        }
+        $branch = git -C $dir.FullName branch --show-current
+        Write-Host "add: $name ($branch)"
+        git subtree add --prefix=$name $dir.FullName $branch
+    }
 
 # Pull the latest changes into every subtree
+[script("pwsh", "-NoProfile")]
 update: add
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for dir in "{{source}}"/*/; do
-        name=$(basename "$dir")
-        branch=$(git -C "$dir" branch --show-current)
-        echo "pull: $name ($branch)"
-        git subtree pull --prefix="$name" "$dir" "$branch" -m "Update $name subtree"
-    done
+    $ErrorActionPreference = 'Stop'
+    $PSNativeCommandUseErrorActionPreference = $true
+    foreach ($dir in Get-ChildItem -Directory '{{source}}') {
+        $name = $dir.Name
+        $branch = git -C $dir.FullName branch --show-current
+        Write-Host "pull: $name ($branch)"
+        git subtree pull --prefix=$name $dir.FullName $branch -m "Update $name subtree"
+    }
