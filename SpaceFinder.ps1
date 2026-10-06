@@ -55,8 +55,10 @@ namespace SpaceFinder1
         public string RootPath;          // non-null only for nodes a scan was started from
         public long Size, Files, Dirs;   // totals for the whole subtree
         public long OwnBytes, OwnFiles;  // files directly inside this folder
+        public long OnlineBytes, OnlineFiles;        // online-only (not downloaded) part of the subtree totals
+        public long OwnOnlineBytes, OwnOnlineFiles;  // online-only part of OwnBytes/OwnFiles
         public int Pending = 1;          // self + unfinished children
-        public bool Done, Denied, IsLink;
+        public bool Done, Denied, IsLink, IsCloud;
         public List<Node> Children;
 
         public Node(string name, Node parent) { Name = name; Parent = parent; }
@@ -95,7 +97,8 @@ namespace SpaceFinder1
         public Node Node;
         public string Name;
         public long Size, Files, Dirs, OwnBytes, OwnFiles;
-        public bool Done, Denied, IsLink;
+        public long OnlineBytes, OnlineFiles, OwnOnlineBytes, OwnOnlineFiles;
+        public bool Done, Denied, IsLink, IsCloud;
         public int ChildCount;
     }
 
@@ -194,7 +197,7 @@ namespace SpaceFinder1
             Node node = item.Node;
             kids.Clear();
             paths.Clear();
-            long bytes = 0, files = 0;
+            long bytes = 0, files = 0, onlineBytes = 0, onlineFiles = 0;
             bool denied = false;
             Node grafted = null;
 
@@ -215,8 +218,11 @@ namespace SpaceFinder1
                             int attr = Marshal.ReadInt32(buf, 0);
                             if ((attr & 0x10) == 0)  // file: read the size straight from the buffer, no allocations
                             {
-                                bytes += ((long)(uint)Marshal.ReadInt32(buf, 28) << 32) | (uint)Marshal.ReadInt32(buf, 32);
+                                long size = ((long)(uint)Marshal.ReadInt32(buf, 28) << 32) | (uint)Marshal.ReadInt32(buf, 32);
+                                bytes += size;
                                 files++;
+                                // RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE: content is not stored locally
+                                if ((attr & 0x441000) != 0) { onlineBytes += size; onlineFiles++; }
                                 continue;
                             }
                             short c0 = Marshal.ReadInt16(buf, 44);
@@ -226,7 +232,12 @@ namespace SpaceFinder1
                                 if (c1 == 0 || (c1 == '.' && Marshal.ReadInt16(buf, 48) == 0)) continue;
                             }
                             string name = Marshal.PtrToStringUni(IntPtr.Add(buf, 44));
-                            bool link = (attr & 0x400) != 0;  // junctions/symlinks are not followed
+                            // Junctions/symlinks are not followed. Only name-surrogate reparse tags point
+                            // elsewhere; others (e.g. OneDrive/Dropbox cloud folders) are real folders.
+                            // dwReserved0 holds the reparse tag when FILE_ATTRIBUTE_REPARSE_POINT is set.
+                            int tag = (attr & 0x400) != 0 ? Marshal.ReadInt32(buf, 36) : 0;
+                            bool link = (tag & 0x20000000) != 0;
+                            bool cloud = (tag & unchecked((int)0xFFFF0FFF)) == unchecked((int)0x9000001A);  // IO_REPARSE_TAG_CLOUD_*
                             if (!link && graft != null && grafted == null && node == Root &&
                                 string.Equals(name, graft.Name, StringComparison.OrdinalIgnoreCase))
                             {
@@ -234,6 +245,7 @@ namespace SpaceFinder1
                                 continue;
                             }
                             Node child = new Node(name, node);
+                            child.IsCloud = cloud;
                             if (link)
                             {
                                 child.IsLink = true;
@@ -264,6 +276,8 @@ namespace SpaceFinder1
             {
                 node.OwnBytes = bytes;
                 node.OwnFiles = files;
+                node.OwnOnlineBytes = onlineBytes;
+                node.OwnOnlineFiles = onlineFiles;
                 node.Denied = denied;
                 int count = kids.Count + (grafted != null ? 1 : 0);
                 if (count > 0)
@@ -274,6 +288,7 @@ namespace SpaceFinder1
                     node.Children = list;
                 }
                 long addSize = bytes, addFiles = files, addDirs = kids.Count;
+                long addOnline = onlineBytes, addOnlineFiles = onlineFiles;
                 for (int i = 0; i < kids.Count; i++)
                 {
                     if (!kids[i].IsLink) { node.Pending++; toScan++; }
@@ -284,6 +299,8 @@ namespace SpaceFinder1
                     addSize += grafted.Size;
                     addFiles += grafted.Files;
                     addDirs += grafted.Dirs + 1;
+                    addOnline += grafted.OnlineBytes;
+                    addOnlineFiles += grafted.OnlineFiles;
                     if (!grafted.Done) node.Pending++;
                 }
                 for (Node a = node; a != null; a = a.Parent)
@@ -291,6 +308,8 @@ namespace SpaceFinder1
                     a.Size += addSize;
                     a.Files += addFiles;
                     a.Dirs += addDirs;
+                    a.OnlineBytes += addOnline;
+                    a.OnlineFiles += addOnlineFiles;
                 }
                 Complete(node);
             }
@@ -326,7 +345,9 @@ namespace SpaceFinder1
             v.Node = n; v.Name = n.Name;
             v.Size = n.Size; v.Files = n.Files; v.Dirs = n.Dirs;
             v.OwnBytes = n.OwnBytes; v.OwnFiles = n.OwnFiles;
-            v.Done = n.Done; v.Denied = n.Denied; v.IsLink = n.IsLink;
+            v.OnlineBytes = n.OnlineBytes; v.OnlineFiles = n.OnlineFiles;
+            v.OwnOnlineBytes = n.OwnOnlineBytes; v.OwnOnlineFiles = n.OwnOnlineFiles;
+            v.Done = n.Done; v.Denied = n.Denied; v.IsLink = n.IsLink; v.IsCloud = n.IsCloud;
             v.ChildCount = n.Children == null ? 0 : n.Children.Count;
             return v;
         }
@@ -401,27 +422,35 @@ namespace SpaceFinder1
 }
 '@
 
+# Compiled types can't be unloaded, so the namespace includes the source hash: an edited
+# script never picks up a stale copy loaded earlier in the same PowerShell session.
 function Initialize-Scanner {
-    if ('SpaceFinder1.Scanner' -as [type]) { return }
-
     $sha = [Security.Cryptography.SHA256]::Create()
     $bytes = [Text.Encoding]::UTF8.GetBytes($script:ScannerSource + $PSVersionTable.PSVersion)
     $hash = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').Substring(0, 16)
-    $dll = Join-Path ([IO.Path]::GetTempPath()) "SpaceFinder_$hash.dll"
+    $ns = "SpaceFinder_$hash"
+    $source = $script:ScannerSource -replace 'namespace SpaceFinder1', "namespace $ns"
+    $dll = Join-Path ([IO.Path]::GetTempPath()) "$ns.dll"
 
-    if (Test-Path -LiteralPath $dll) {
-        try { Add-Type -Path $dll; return } catch { }
-    }
-    [Console]::Write('SpaceFinder: preparing scanner...')
-    try {
-        Add-Type -TypeDefinition $script:ScannerSource -OutputAssembly $dll -OutputType Library
-        Add-Type -Path $dll
-    }
-    catch {
-        if (-not ('SpaceFinder1.Scanner' -as [type])) {
-            Add-Type -TypeDefinition $script:ScannerSource
+    if (-not ("$ns.Scanner" -as [type])) {
+        $loaded = $false
+        if (Test-Path -LiteralPath $dll) {
+            try { Add-Type -Path $dll; $loaded = $true } catch { }
+        }
+        if (-not $loaded) {
+            [Console]::Write('SpaceFinder: preparing scanner...')
+            try {
+                Add-Type -TypeDefinition $source -OutputAssembly $dll -OutputType Library
+                Add-Type -Path $dll
+            }
+            catch {
+                if (-not ("$ns.Scanner" -as [type])) { Add-Type -TypeDefinition $source }
+            }
         }
     }
+    $script:Scanner = "$ns.Scanner" -as [type]
+    $script:NodeType = "$ns.Node" -as [type]
+    $script:ConsoleHelper = "$ns.ConsoleHelper" -as [type]
 }
 
 # ---------------------------------------------------------------------------
@@ -508,15 +537,15 @@ function Show-Frame($S, [int]$W, [int]$H) {
         return
     }
 
-    $cur = [SpaceFinder1.Scanner]::GetView($S.Current)
-    $list = [SpaceFinder1.Scanner]::GetChildren($S.Current)
+    $cur = $script:Scanner::GetView($S.Current)
+    $list = $script:Scanner::GetChildren($S.Current)
     $count = $list.Length
     $S.List = $list
     $listH = $H - 5
     $S.ListH = $listH
 
     # Keep the selection on the same folder even as the order changes during the scan.
-    $idx = [SpaceFinder1.Scanner]::IndexOf($list, $S.SelNode)
+    $idx = $script:Scanner::IndexOf($list, $S.SelNode)
     if ($idx -lt 0) {
         $idx = [Math]::Max(0, [Math]::Min($S.SelIndex, $count - 1))
         if ($null -eq $S.SelNode -and $count -gt 0) { $S.SelNode = $list[$idx].Node }
@@ -536,8 +565,14 @@ function Show-Frame($S, [int]$W, [int]$H) {
     Add-Row $sb 1 $max @("$E[1;97;48;5;25m", ' SpaceFinder ', "$E[0m", ' ', "$E[1;38;5;117m", $path)
 
     # Row 2: totals + scan state
-    $segs = @("$E[38;5;250m", ' Total ', "$E[1;97m", (Format-Size $cur.Size), "$E[0;38;5;250m",
-              ('   {0:N0} folders   {1:N0} files   ' -f $cur.Dirs, $cur.Files))
+    $segs = @("$E[38;5;250m", ' Total ', "$E[1;97m", (Format-Size $cur.Size))
+    $hasCloud = $cur.IsCloud -or $cur.OnlineBytes -gt 0
+    foreach ($v in $list) { if ($v.IsCloud) { $hasCloud = $true; break } }
+    if ($hasCloud) {
+        $segs += @("$E[0;38;5;250m", ' = ', "$E[1;97m", (Format-Size ($cur.Size - $cur.OnlineBytes)), "$E[0;38;5;250m", ' on disk + ',
+                   "$E[1;38;5;111m", (Format-Size $cur.OnlineBytes), "$E[0;38;5;250m", ' online-only')
+    }
+    $segs += @("$E[0;38;5;250m", ('   {0:N0} folders   {1:N0} files   ' -f $cur.Dirs, $cur.Files))
     if ($status.Running) {
         $segs += @("$E[1;93m", "$spin Scanning... ", "$E[0;33m",
                    ('{0:N0} folders read, {1:0.0}s' -f $status.Dirs, $status.Elapsed.TotalSeconds))
@@ -586,9 +621,18 @@ function Show-Frame($S, [int]$W, [int]$H) {
         $rank = if ($top) { "#$($i + 1)" } else { [string]($i + 1) }
         $pct = if ($total -gt 0) { '{0:0.0}%' -f ($v.Size * 100.0 / $total) } else { '' }
         $frac = if ($maxSize -gt 0) { $v.Size / $maxSize } else { 0 }
+        # Bar: on-disk part in the row color, online-only part dimmed.
+        $bar = Get-Bar $frac $barW
+        $localCells = $barW
+        if ($v.OnlineBytes -gt 0 -and $maxSize -gt 0) {
+            $localCells = [int][Math]::Round(($v.Size - $v.OnlineBytes) / $maxSize * $barW)
+        }
         $name = $v.Name + '\'
         if ($v.IsLink) { $name += '  (link, not followed)' }
         elseif ($v.Denied) { $name += '  (access denied)' }
+        elseif ($v.IsCloud -or $v.OnlineBytes -gt 0) {
+            $name += '  ({0} on disk, {1} online-only)' -f (Format-Size ($v.Size - $v.OnlineBytes)), (Format-Size $v.OnlineBytes)
+        }
         if ($name.Length -gt $nameW) { $name = $name.Substring(0, $nameW - 1) + $script:Ellipsis }
 
         $marker = if ($sel) { "$E[1;97m> " } else { '  ' }
@@ -598,7 +642,8 @@ function Show-Frame($S, [int]$W, [int]$H) {
             $sizeStyle, (Format-Size $v.Size).PadLeft(9), '', ' ',
             $stateStyle, $state, '', ' ',
             "$E[22;38;5;245m", $pct.PadLeft(6), '', ' ',
-            "$E[38;5;$($barColor)m$E[48;5;236m", (Get-Bar $frac $barW), $bg, ' ',
+            "$E[38;5;$($barColor)m$E[48;5;236m", $bar.Substring(0, $localCells),
+            "$E[38;5;240m", $bar.Substring($localCells), $bg, ' ',
             $nameStyle, $name
         ) $(if ($sel) { $bg } else { '' })
     }
@@ -610,8 +655,18 @@ function Show-Frame($S, [int]$W, [int]$H) {
     else {
         $S.Message = $null
         $pos = if ($count -gt 0) { "  |  $($idx + 1) of $count" } else { '' }
-        $info = ' Files directly in this folder: {0} ({1:N0} files){2}' -f (Format-Size $cur.OwnBytes), $cur.OwnFiles, $pos
-        Add-Row $sb ($H - 1) $max @("$E[38;5;244m", $info)
+        $info = ' Files directly in this folder: {0} ({1:N0} files)' -f (Format-Size $cur.OwnBytes), $cur.OwnFiles
+        if ($cur.OwnOnlineFiles -gt 0) {
+            $info += ', {0} online-only ({1:N0} files)' -f (Format-Size $cur.OwnOnlineBytes), $cur.OwnOnlineFiles
+        }
+        $infoSegs = @("$E[38;5;244m", $info + $pos)
+        # Cloud folder selected: show its full breakdown first, since the name column may be truncated.
+        if ($count -gt 0 -and ($list[$idx].IsCloud -or $list[$idx].OnlineBytes -gt 0)) {
+            $v = $list[$idx]
+            $infoSegs = @("$E[38;5;111m", (' {0}: {1} total = {2} on disk + {3} online-only ({4:N0} files)  |' -f
+                $v.Name, (Format-Size $v.Size), (Format-Size ($v.Size - $v.OnlineBytes)), (Format-Size $v.OnlineBytes), $v.OnlineFiles)) + $infoSegs
+        }
+        Add-Row $sb ($H - 1) $max $infoSegs
     }
 
     # Row H: key help
@@ -661,8 +716,8 @@ function Open-Parent($S) {
         $parentPath = $null
         try { $parentPath = [IO.Path]::GetDirectoryName($cur.RootPath) } catch { }
         if ([string]::IsNullOrEmpty($parentPath)) { Set-Message $S 'Already at the top level.'; return }
-        $parent = [SpaceFinder1.Node]::CreateRoot($parentPath)
-        $S.Scanners.Add([SpaceFinder1.Scanner]::Start($parent, $cur))
+        $parent = $script:NodeType::CreateRoot($parentPath)
+        $S.Scanners.Add($script:Scanner::Start($parent, $cur))
         $S.UpLinks[$cur] = $parent
     }
     $S.Memory[$cur] = $S.SelNode
@@ -677,8 +732,8 @@ function Restart-Scan($S) {
     $S.Scanners.Clear()
     $S.Memory.Clear()
     $S.UpLinks.Clear()
-    $root = [SpaceFinder1.Node]::CreateRoot($path)
-    $S.Scanners.Add([SpaceFinder1.Scanner]::Start($root, $null))
+    $root = $script:NodeType::CreateRoot($path)
+    $S.Scanners.Add($script:Scanner::Start($root, $null))
     $S.Current = $root
     $S.SelNode = $null
     $S.SelIndex = 0
@@ -741,7 +796,7 @@ function Start-SpaceFinder([string]$Path) {
 
     Initialize-Scanner
 
-    $root = [SpaceFinder1.Node]::CreateRoot($rootPath)
+    $root = $script:NodeType::CreateRoot($rootPath)
     $S = @{
         Current   = $root
         SelNode   = $null
@@ -756,10 +811,10 @@ function Start-SpaceFinder([string]$Path) {
         MessageAt = 0
         Quit      = $false
     }
-    $S.Scanners.Add([SpaceFinder1.Scanner]::Start($root, $null))
+    $S.Scanners.Add($script:Scanner::Start($root, $null))
 
     $E = $script:E
-    $oldMode = [SpaceFinder1.ConsoleHelper]::EnableVirtualTerminal()
+    $oldMode = $script:ConsoleHelper::EnableVirtualTerminal()
     $oldEncoding = [Console]::OutputEncoding
     $oldCtrlC = [Console]::TreatControlCAsInput
     try {
@@ -804,7 +859,7 @@ function Start-SpaceFinder([string]$Path) {
         [Console]::Out.Flush()
         [Console]::TreatControlCAsInput = $oldCtrlC
         [Console]::OutputEncoding = $oldEncoding
-        [SpaceFinder1.ConsoleHelper]::RestoreMode($oldMode)
+        $script:ConsoleHelper::RestoreMode($oldMode)
     }
 }
 
