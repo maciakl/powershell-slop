@@ -1,5 +1,6 @@
 # Each sub-folder of `source` is its own git repo, mirrored here as a subtree
-# under a prefix of the same name.
+# under a prefix of the same name. Folders prefixed with `_` and folders that
+# are not git repos are ignored.
 
 source := "D:/code/powershell"
 
@@ -8,7 +9,7 @@ source := "D:/code/powershell"
 add:
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $true
-    foreach ($dir in Get-ChildItem -Directory '{{source}}') {
+    foreach ($dir in Get-ChildItem -Directory '{{source}}' | Where-Object { $_.Name -notlike '_*' -and (Test-Path (Join-Path $_.FullName '.git')) }) {
         $name = $dir.Name
         if (git log -1 --format=%H --grep="^git-subtree-dir: $name`$") {
             Write-Host "skip: $name (already a subtree)"
@@ -24,7 +25,7 @@ add:
 update: add
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $true
-    foreach ($dir in Get-ChildItem -Directory '{{source}}') {
+    foreach ($dir in Get-ChildItem -Directory '{{source}}' | Where-Object { $_.Name -notlike '_*' -and (Test-Path (Join-Path $_.FullName '.git')) }) {
         $name = $dir.Name
         $branch = git -C $dir.FullName branch --show-current
         Write-Host "pull: $name ($branch)"
