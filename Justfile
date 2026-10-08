@@ -22,7 +22,7 @@ add:
 
 # Pull the latest changes into every subtree
 [script("pwsh", "-NoProfile")]
-update: add
+update:
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $true
     foreach ($dir in Get-ChildItem -Directory '{{source}}' | Where-Object { $_.Name -notlike '_*' -and (Test-Path (Join-Path $_.FullName '.git')) }) {
