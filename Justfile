@@ -31,3 +31,20 @@ update: add
         Write-Host "pull: $name ($branch)"
         git subtree pull --prefix=$name $dir.FullName $branch -m "Update $name subtree"
     }
+
+dest := "R:/Misc/Scripts"
+
+# Copy each sub-folder's .ps1 file to {{dest}} when it is newer than the copy there
+[script("pwsh", "-NoProfile")]
+deploy:
+    $ErrorActionPreference = 'Stop'
+    New-Item -ItemType Directory -Force '{{dest}}' | Out-Null
+    foreach ($file in Get-ChildItem -Directory | Get-ChildItem -File -Filter *.ps1) {
+        $target = Join-Path '{{dest}}' $file.Name
+        if ((Test-Path $target) -and $file.LastWriteTimeUtc -le (Get-Item $target).LastWriteTimeUtc) {
+            Write-Host "skip: $($file.Name) (up to date)"
+            continue
+        }
+        Write-Host "copy: $($file.Name)"
+        Copy-Item $file.FullName $target
+    }
