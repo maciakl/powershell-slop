@@ -4,7 +4,8 @@ A keyboard-driven calendar for the Windows terminal, written as a single
 PowerShell script. It shows month, week, day and agenda views, lets you add
 and edit events with all the fields iCloud and Google Calendar use, and
 synchronises in both directions with **iCloud Calendar**, **Google Calendar**
-and any other **CalDAV** server.
+and any other **CalDAV** server. A **US holidays** calendar is built in, and
+you can subscribe to any published `.ics` / `webcal://` calendar.
 
 ```
  PSCalendar  Month  Week  Day  Agenda   ◄ October 2026 ►
@@ -15,7 +16,7 @@ and any other **CalDAV** server.
                  │                │                │                │                │ 10:00pm Dentist│
 ```
 
-Version: **0.1.0**
+Version: **0.2.0**
 
 ## Contents
 
@@ -26,6 +27,7 @@ Version: **0.1.0**
 - [Connecting iCloud](#connecting-icloud)
 - [Connecting Google Calendar](#connecting-google-calendar)
 - [Other CalDAV servers](#other-caldav-servers)
+- [Holidays and subscribed calendars](#holidays-and-subscribed-calendars)
 - [How synchronisation works](#how-synchronisation-works)
 - [Event fields](#event-fields)
 - [Where data is stored](#where-data-is-stored)
@@ -142,20 +144,21 @@ Event, account and option screens are forms:
 
 | Key | Action |
 |-----|--------|
-| A | Add an account: iCloud, Google, other CalDAV, or a local calendar |
+| A | Add an account: iCloud, Google, other CalDAV, a subscribed calendar (`.ics` / `webcal://` address), or a local calendar |
 | N | New local calendar (stays on this computer) |
 | Enter | Edit the selected account (name, password, re-sign-in) or calendar (name, colour, show/hide, sync, default) |
 | Space | Show or hide the selected calendar |
 | Y | Turn sync on or off for the selected calendar |
 | R | Re-read the calendar list from the server and choose calendars again |
-| S | Synchronise the selected account now |
+| S | Synchronise the selected account now (subscriptions are downloaded again) |
 | Del | Remove the account or calendar from PSCalendar (nothing is deleted on the server) |
 | Esc | Back |
 
 ### Options (O)
 
 Week start, 12/24-hour clock, the hour the timeline scrolls to, default
-calendar, default event length and reminder, agenda length, sync on start,
+calendar, default event length and reminder, agenda length, US holidays
+(off, public holidays, or holidays and observances), sync on start,
 automatic sync interval, how far back and ahead to sync, conflict handling,
 and whether Google e-mails guests about changes.
 
@@ -217,6 +220,58 @@ the standard CalDAV discovery (`current-user-principal` →
 | Fastmail | `https://caldav.fastmail.com/` |
 | Radicale | `https://radicale.example.com/` |
 
+## Holidays and subscribed calendars
+
+### US holidays
+
+A read-only **US Holidays** calendar is switched on by default. It is a
+subscription to Google's free public holiday calendar
+(`Holidays in United States`), so no Google account or sign-in is needed.
+The feed covers about five years back and five years ahead and is kept up to
+date by Google (new federal holidays, substitute days and so on).
+
+Choose what you see in **Options (O) → US holidays**:
+
+| Setting | Shows |
+|---------|-------|
+| **Public holidays** (default) | Federal holidays and their substitute days: New Year's Day, MLK Day, Juneteenth, Thanksgiving ... |
+| **Holidays and observances** | Also observances such as Valentine's Day, Mother's Day, Halloween and daylight saving time changes |
+| **Off** | Nothing. The calendar and its downloaded events are removed and nothing is downloaded |
+
+To hide the holidays for a while without turning them off, select
+**US Holidays** on the Calendars screen (**C**) and press **Space**. You can
+also change its colour there. Removing it with **Del** is the same as
+choosing **Off**.
+
+The holidays are downloaded at start-up when they are more than a day old,
+and whenever you press **S**. They stay on this computer, so they are shown
+offline too. Downloading them sends an ordinary web request to
+`calendar.google.com`; choose **Off** if you don't want that.
+
+To show another country's holidays, subscribe to that country's feed (see
+below), for example
+`https://calendar.google.com/calendar/ical/en.uk%23holiday%40group.v.calendar.google.com/public/basic.ics`
+for the United Kingdom, and switch the US holidays off.
+
+### Subscribing to a calendar address
+
+Many sites publish calendars as a link ending in `.ics` or starting with
+`webcal://` (sports fixtures, school terms, a colleague's shared calendar,
+the "secret address in iCal format" of a Google calendar ...). To add one:
+
+1. Press **C**, then **A**, and choose **Subscribe to a calendar address**.
+2. Paste the address. Leave the name empty to use the calendar's own name.
+3. PSCalendar downloads it right away.
+
+Subscribed calendars are **read only**. They are downloaded again once a day
+(or as often as the calendar asks with `REFRESH-INTERVAL` /
+`X-PUBLISHED-TTL`, between one hour and one week) and whenever you press
+**S**. When the server supports it, an unchanged calendar isn't downloaded
+again (`If-None-Match`). The whole calendar is downloaded, not only the sync
+window, and events removed from it are removed here. Press **Enter** on the
+subscription in the Calendars screen to rename it, change its address or
+pause it.
+
 ## How synchronisation works
 
 - **Two-way.** Local changes (new, edited and deleted events) are uploaded
@@ -225,7 +280,9 @@ the standard CalDAV discovery (`current-user-principal` →
   adjustable in Options). Events deleted on the server are removed locally.
 - **When.** On start-up (unless `-NoSync`), every 15 minutes while
   PSCalendar is open (adjustable, 0 turns it off), when you press **S**, and
-  with `-SyncOnly`.
+  with `-SyncOnly`. Subscribed calendars (including the holidays) only
+  download when they are due, see
+  [above](#holidays-and-subscribed-calendars), or when you press **S**.
 - **Offline.** Changes made while offline stay on this computer and are
   uploaded at the next successful sync. The title bar shows how many changes
   are waiting.
@@ -324,11 +381,31 @@ To start over, quit PSCalendar and delete the folder.
 - Only events inside the sync window are downloaded; older and later events
   stay as they were last downloaded.
 - Wide characters (CJK, emoji) can push columns out of line.
+- Subscribed calendars can't be edited, and only one calendar is read from
+  each address.
+- The built-in holidays are the US ones; other countries are added as a
+  subscription.
 - Events in Google calendars you can only read, and invitations you don't
   own, may be refused by the server when edited (see "Rejected changes"
   above).
 
 ## Changelog
+
+### 0.2.0 - 2026-10-17
+
+- Built-in **US Holidays** calendar from Google's public holiday feed, on by
+  default. **Options → US holidays** chooses public holidays only, holidays
+  and observances, or off. It can be hidden, recoloured or removed on the
+  Calendars screen like any other calendar.
+- New account type: **subscribe to a calendar address** (`.ics`,
+  `webcal://`). Subscriptions are read only, refresh once a day (or as the
+  feed asks) and on **S**, and skip the download when the server reports no
+  change.
+- Downloads accept gzip/deflate compression.
+- A calendar can only be removed if another calendar that accepts new
+  events is left.
+- Automatic syncs that have nothing to do no longer overwrite the status
+  line.
 
 ### 0.1.0 - 2026-10-16
 
