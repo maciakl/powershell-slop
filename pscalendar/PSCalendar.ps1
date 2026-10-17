@@ -15,7 +15,9 @@
       * iCloud Calendar     - CalDAV with an app-specific password
       * Google Calendar     - Google Calendar API v3 with OAuth 2.0 (PKCE)
       * Other CalDAV server - Nextcloud, Fastmail, Radicale, ...
-    Local calendars that never leave the computer are supported too.
+    Local calendars that never leave the computer are supported too, as are
+    read-only subscribed calendars (any .ics / webcal:// address). A US
+    holidays calendar is built in and can be switched off in Options.
 
     The whole application is this one script. It only uses components that
     ship with Windows 11 (Windows PowerShell 5.1 or PowerShell 7 and .NET).
@@ -58,7 +60,7 @@
 
 .NOTES
     Name    : PSCalendar
-    Version : 0.1.0
+    Version : 0.2.0
 #>
 #requires -Version 5.1
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
@@ -97,7 +99,7 @@ $ErrorActionPreference = 'Stop'
 #region ------------------------------------------------------------ Constants and state
 
 $script:AppName = 'PSCalendar'
-$script:AppVersion = '0.1.0'
+$script:AppVersion = '0.2.0'
 $script:ProdId = '-//PSCalendar//PSCalendar ' + $script:AppVersion + '//EN'
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $script:E = [string][char]27
@@ -126,6 +128,17 @@ $script:GoogleTokenUrl = 'https://oauth2.googleapis.com/token'
 $script:GoogleApiBase = 'https://www.googleapis.com/calendar/v3'
 $script:GoogleScope = 'https://www.googleapis.com/auth/calendar'
 
+# Built-in US holidays calendar: a read-only subscription to Google's public
+# holiday feed (free, no account or key needed, covers about ten years and
+# labels each event "Public holiday" or "Observance").
+$script:HolidayAccountId = 'holidays'
+$script:HolidayCalendarId = 'holidays-us'
+$script:HolidayFeedUrl = 'https://calendar.google.com/calendar/ical/en.usa%23holiday%40group.v.calendar.google.com/public/basic.ics'
+$script:HolidayModes = [ordered]@{ Off = 'Off'; Public = 'Public holidays'; All = 'Holidays and observances' }
+# Subscribed calendars are downloaded at most this often unless the feed asks
+# for another interval (REFRESH-INTERVAL / X-PUBLISHED-TTL) or you press S.
+$script:SubscriptionRefreshMinutes = 1440
+
 # iCalendar weekday codes <-> .NET DayOfWeek.
 $script:DayCodes = @{
     SU = [DayOfWeek]::Sunday; MO = [DayOfWeek]::Monday; TU = [DayOfWeek]::Tuesday
@@ -153,6 +166,9 @@ $script:ConsoleRgb = [ordered]@{
 }
 $script:CalendarPalette = @('Cyan', 'Green', 'Yellow', 'Magenta', 'Red', 'Blue', 'DarkYellow', 'DarkCyan', 'DarkGreen', 'DarkMagenta')
 # Console colours that need black text on top of them.
+# Cursor highlight: White is never used as an event colour, so it stands out.
+$script:CursorFg = 'Black'
+$script:CursorBg = 'White'
 $script:LightColors = @('Gray', 'Green', 'Cyan', 'Yellow', 'White', 'Magenta', 'DarkYellow', 'DarkCyan')
 
 # ANSI SGR foreground codes indexed by [ConsoleColor] value.
@@ -736,11 +752,12 @@ function New-DefaultSettings {
         ConflictPolicy    = 'Server'
         GoogleSendUpdates = 'all'
         AgendaDays        = 60
+        Holidays          = 'Public'   # US holidays calendar: Off, Public or All (with observances)
     }
 }
 
 function New-AccountObject {
-    <# Creates an account record. Type is Local, iCloud, CalDAV or Google. #>
+    <# Creates an account record. Type is Local, iCloud, CalDAV, Google or Subscription (read-only .ics URL in ServerUrl). #>
     param([string]$Type = 'Local', [string]$Name = '')
     return [pscustomobject]@{
         Id           = New-Id
@@ -773,6 +790,7 @@ function New-CalendarObject {
         CTag       = ''
         LastWindow = ''
         LastSync   = ''
+        RefreshMinutes = 0   # subscriptions: refresh interval the feed asked for (0 = default)
     }
 }
 
@@ -828,6 +846,8 @@ function Initialize-Storage {
         $cfg.Calendars.Insert(0, $cal)
     }
     $script:Config = $cfg
+    if (-not $script:HolidayModes.Contains([string]$cfg.Settings.Holidays)) { $cfg.Settings.Holidays = 'Public' }
+    Update-HolidayCalendar
     if (-not (Get-Calendar $cfg.Settings.DefaultCalendarId)) { $cfg.Settings.DefaultCalendarId = $cfg.Calendars[0].Id }
 
     $script:Events.Clear()
@@ -838,6 +858,37 @@ function Initialize-Storage {
     }
     $script:DataVersion++
     Save-Config
+}
+
+function Update-HolidayCalendar {
+    <# Adds or removes the built-in US holidays subscription so it matches the Holidays option. #>
+    $cfg = $script:Config
+    $acc = Get-Account $script:HolidayAccountId
+    $cal = Get-Calendar $script:HolidayCalendarId
+    if ($cfg.Settings.Holidays -eq 'Off') {
+        if ($null -ne $cal) { Remove-LocalCalendar $cal }
+        if ($null -ne $acc) { [void]$cfg.Accounts.Remove($acc) }
+        return
+    }
+    if ($null -eq $acc) {
+        $acc = New-AccountObject -Type 'Subscription' -Name 'Holidays'
+        $acc.Id = $script:HolidayAccountId
+        $acc.ServerUrl = $script:HolidayFeedUrl
+        $cfg.Accounts.Add($acc)
+    }
+    if ($null -eq $cal) {
+        $cal = New-CalendarObject -AccountId $acc.Id -Name 'US Holidays' -RemoteId $acc.ServerUrl -Color 'DarkGreen'
+        $cal.Id = $script:HolidayCalendarId
+        $cal.ReadOnly = $true
+        $cfg.Calendars.Add($cal)
+    }
+}
+
+function Test-HiddenObservance {
+    <# True for an observance (Valentine's Day, ...) in the holidays calendar while only public holidays are shown. #>
+    param($Event)
+    return ($Event.CalendarId -eq $script:HolidayCalendarId -and $script:Config.Settings.Holidays -eq 'Public' -and
+        $Event.Description.StartsWith('Observance', [StringComparison]::OrdinalIgnoreCase))
 }
 
 function Save-Config {
@@ -923,19 +974,12 @@ function Get-ContrastColor {
 }
 
 function Get-EventBlockColor {
-    <# Fg/Bg for an event block: a dim shade normally, the bright shade when selected.
-       -Plain uses the month view's colors instead: gray normally, cyan when selected. #>
+    <# Fg/Bg for an event block: a dim shade of its colour normally, the cursor colour when selected.
+       -Plain uses gray for unselected blocks instead. #>
     param([string]$Color, [bool]$Selected, [switch]$Plain)
-    if ($Plain) {
-        if ($Selected) { return @{ Fg = 'Black'; Bg = 'Cyan' } }
-        return @{ Fg = 'White'; Bg = 'DarkGray' }
-    }
+    if ($Selected) { return @{ Fg = $script:CursorFg; Bg = $script:CursorBg } }
+    if ($Plain) { return @{ Fg = 'White'; Bg = 'DarkGray' } }
     $c = [int][ConsoleColor]$Color
-    if ($Selected) {
-        if ($c -eq 8) { $c = 7 }           # DarkGray -> Gray
-        elseif ($c -lt 8) { $c += 8 }      # DarkCyan -> Cyan, Gray -> White
-        return @{ Fg = 'Black'; Bg = [string][ConsoleColor]$c }
-    }
     if ($c -gt 8) { $c -= 8 }              # Cyan -> DarkCyan, White -> Gray
     $bg = [string][ConsoleColor]$c
     return @{ Fg = (Get-ContrastColor $bg); Bg = $bg }
@@ -1562,6 +1606,7 @@ function Get-EventInstance {
     foreach ($ev in $script:Events) {
         if ($ev.Deleted -or -not $ev.Start -or -not $visible.ContainsKey($ev.CalendarId)) { continue }
         if ($ev.RecurrenceId -and $ev.Status -eq 'CANCELLED') { continue }
+        if (Test-HiddenObservance $ev) { continue }
         $cal = $visible[$ev.CalendarId]
         try {
             $sw = ConvertFrom-WallString $ev.Start
@@ -1675,6 +1720,8 @@ function Initialize-Http {
     $handler = New-Object System.Net.Http.HttpClientHandler
     $handler.AllowAutoRedirect = $false
     $handler.UseCookies = $false
+    # Some feeds (iCloud holidays, for example) are always sent gzip-compressed.
+    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(60)
     [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'PSCalendar/' + $script:AppVersion)
@@ -2473,17 +2520,92 @@ function Sync-GoogleCalendar {
     Write-SyncLog ('{0}: {1} events, {2} new, {3} removed' -f $Calendar.Name, $stats.Total, $stats.Added, $stats.Removed)
 }
 
+function ConvertTo-FeedUrl {
+    <# Turns a subscription address (webcal://, webcals://, http(s)://) into the URL to download. #>
+    param([string]$Url)
+    $u = $Url.Trim()
+    if ($u -match '^(?i)webcals?://') { $u = 'https://' + ($u -replace '^(?i)webcals?://', '') }
+    return $u
+}
+
+function Get-SubscriptionFeed {
+    <#
+        Downloads a subscribed calendar. Sends the last ETag so an unchanged
+        feed costs nothing. Returns $null when the feed has not changed,
+        otherwise the parsed tree, the ETag and the calendar's own name.
+    #>
+    param([string]$Url, [string]$ETag = '')
+    $headers = @{ Accept = 'text/calendar, */*;q=0.5' }
+    if ($ETag) { $headers['If-None-Match'] = $ETag }
+    $r = Invoke-HttpRequest -Method 'GET' -Uri (ConvertTo-FeedUrl $Url) -Headers $headers
+    if ($r.StatusCode -eq 304) { return $null }
+    if ($r.StatusCode -ne 200) { throw ('Download failed: HTTP {0} {1}' -f $r.StatusCode, $r.Reason) }
+    if ($r.Body -notmatch 'BEGIN:VCALENDAR') { throw 'The address did not return a calendar (.ics) file.' }
+    $root = ConvertFrom-ICalText $r.Body
+    $name = ''
+    $refresh = 0
+    foreach ($vcal in @(Get-ICalComponent -Node $root -Type 'VCALENDAR')) {
+        foreach ($p in $vcal.Props) {
+            if ($p.Name -eq 'X-WR-CALNAME' -or $p.Name -eq 'NAME') { $name = ConvertFrom-ICalTextValue $p.Value.Trim() }
+            elseif ($p.Name -eq 'REFRESH-INTERVAL' -or $p.Name -eq 'X-PUBLISHED-TTL') { $refresh = [int](ConvertFrom-ICalDuration $p.Value.Trim()).TotalMinutes }
+        }
+    }
+    return [pscustomobject]@{ Root = $root; ETag = $r.ETag; Name = $name; RefreshMinutes = $refresh }
+}
+
+function Test-SubscriptionDue {
+    <# True when a subscribed calendar should be downloaded again. #>
+    param($Calendar)
+    if (-not $Calendar.LastSync) { return $true }
+    $minutes = [int]$Calendar.RefreshMinutes
+    if ($minutes -le 0) { $minutes = $script:SubscriptionRefreshMinutes }
+    $minutes = [Math]::Min([Math]::Max($minutes, 60), 10080)   # between one hour and one week
+    try { return (((Get-Date) - (ConvertFrom-WallString $Calendar.LastSync)).TotalMinutes -ge $minutes) }
+    catch { return $true }
+}
+
+function Sync-SubscriptionCalendar {
+    <# Downloads a read-only subscribed calendar (.ics feed) and replaces the local copy. #>
+    param($Account, $Calendar)
+    $feed = Get-SubscriptionFeed -Url $Calendar.RemoteId -ETag $Calendar.CTag
+    if ($null -eq $feed) { Write-SyncLog "$($Calendar.Name): no changes on the server"; return }
+    $remote = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($comp in @(Get-ICalComponent -Node $feed.Root -Type 'VEVENT')) {
+        try {
+            $ev = ConvertFrom-ICalEvent -Component $comp -CalendarId $Calendar.Id
+            if ($null -eq $ev) { continue }
+            # Google appends instructions for its own settings page; they don't apply here.
+            $ev.Description = $ev.Description -replace '(?s)\r?\nTo hide observances.*$', ''
+            $remote.Add($ev)
+        }
+        catch { Write-SyncLog ('WARNING could not read an event in {0}: {1}' -f $Calendar.Name, $_.Exception.Message) }
+    }
+    # The whole feed is the server copy, so anything missing from it is gone.
+    $all = [pscustomobject]@{ From = [datetime]::MinValue; To = [datetime]::MaxValue }
+    $stats = Merge-RemoteEvent -Calendar $Calendar -Remote $remote.ToArray() -KeyName 'Uid' -Window $all
+    $Calendar.CTag = $feed.ETag
+    $Calendar.RefreshMinutes = $feed.RefreshMinutes
+    Write-SyncLog ('{0}: {1} events, {2} new, {3} removed' -f $Calendar.Name, $stats.Total, $stats.Added, $stats.Removed)
+}
+
 function Sync-AllCalendar {
-    <# Synchronises every enabled calendar (optionally of one account). #>
-    param([string]$AccountId = '')
+    <#
+        Synchronises every enabled calendar (optionally of one account).
+        Subscribed calendars are skipped until their refresh interval has
+        passed, unless -Force is given (a sync the user asked for).
+    #>
+    param([string]$AccountId = '', [switch]$Force)
     $script:LastSyncAttempt = Get-Date
     $errors = 0
     $count = 0
     foreach ($acc in @($script:Config.Accounts | Where-Object { $_.Type -ne 'Local' -and $_.Enabled -and (-not $AccountId -or $_.Id -eq $AccountId) })) {
         foreach ($cal in @($script:Config.Calendars | Where-Object { $_.AccountId -eq $acc.Id -and $_.Sync })) {
+            if ($acc.Type -eq 'Subscription' -and -not $Force -and -not (Test-SubscriptionDue $cal)) { continue }
             Write-SyncProgress ('{0}: {1}' -f $acc.Name, $cal.Name)
             try {
-                if ($acc.Type -eq 'Google') { Sync-GoogleCalendar $acc $cal } else { Sync-CalDavCalendar $acc $cal }
+                if ($acc.Type -eq 'Google') { Sync-GoogleCalendar $acc $cal }
+                elseif ($acc.Type -eq 'Subscription') { Sync-SubscriptionCalendar $acc $cal }
+                else { Sync-CalDavCalendar $acc $cal }
                 $cal.LastSync = ConvertTo-WallString (Get-Date)
                 $count++
             }
@@ -2497,6 +2619,7 @@ function Sync-AllCalendar {
     Save-EventStore
     $script:LastSyncTime = Get-Date
     if ($errors) { $summary = 'Sync finished with {0} error(s). Press L to see the log.' -f $errors }
+    elseif ($count -eq 0) { $summary = 'Calendars are up to date.' }
     else { $summary = 'Synchronised {0} calendar(s).' -f $count }
     Write-SyncLog $summary
     return [pscustomobject]@{ Errors = $errors; Calendars = $count; Summary = $summary }
@@ -3691,6 +3814,11 @@ function Remove-LocalCalendar {
     param($Calendar)
     Remove-StoredEvent @($script:Events | Where-Object { $_.CalendarId -eq $Calendar.Id })
     [void]$script:Config.Calendars.Remove($Calendar)
+    if ($Calendar.Id -eq $script:HolidayCalendarId) { $script:Config.Settings.Holidays = 'Off' }
+    $acc = Get-Account $Calendar.AccountId
+    if ($null -ne $acc -and $acc.Type -eq 'Subscription' -and -not @($script:Config.Calendars | Where-Object { $_.AccountId -eq $acc.Id })) {
+        [void]$script:Config.Accounts.Remove($acc)
+    }
     if ($script:Config.Settings.DefaultCalendarId -eq $Calendar.Id) {
         $first = @($script:Config.Calendars | Where-Object { -not $_.ReadOnly }) | Select-Object -First 1
         if ($null -ne $first) { $script:Config.Settings.DefaultCalendarId = $first.Id }
@@ -3730,10 +3858,12 @@ function Connect-GoogleAccount {
 }
 
 function Add-AccountInteractive {
-    <# Guides the user through adding an iCloud, Google, CalDAV or local calendar. #>
-    $c = Read-TuiChoice -Title 'Add calendars' -Options @('iCloud Calendar', 'Google Calendar', 'Other CalDAV server (Nextcloud, Fastmail, ...)', 'Local calendar (not synchronised)')
+    <# Guides the user through adding an iCloud, Google, CalDAV, subscribed or local calendar. #>
+    $c = Read-TuiChoice -Title 'Add calendars' -Options @('iCloud Calendar', 'Google Calendar', 'Other CalDAV server (Nextcloud, Fastmail, ...)',
+        'Subscribe to a calendar address (.ics, webcal://)', 'Local calendar (not synchronised)')
     if ($c -lt 0) { return }
-    if ($c -eq 3) { New-LocalCalendarInteractive; return }
+    if ($c -eq 3) { Add-SubscriptionInteractive; return }
+    if ($c -eq 4) { New-LocalCalendarInteractive; return }
     $acc = $null
     if ($c -eq 0 -or $c -eq 2) {
         $isICloud = ($c -eq 0)
@@ -3788,6 +3918,37 @@ function Add-AccountInteractive {
     if (Read-TuiConfirm -Title $acc.Name -Message 'Account added. Synchronise it now?') { Invoke-SyncInteractive -AccountId $acc.Id }
 }
 
+function Add-SubscriptionInteractive {
+    <# Subscribes to a read-only calendar published as an .ics / webcal:// address. #>
+    $fields = @(
+        New-FormField -Key 'Url' -Label 'Calendar address' -Value 'https://' -Hint 'An .ics or webcal:// link, e.g. a team, school or sports calendar'
+        New-FormField -Key 'Name' -Label 'Name' -Hint 'Leave blank to use the name the calendar gives itself'
+    )
+    $intro = 'Subscribed calendars are read only. PSCalendar downloads them again once a day (or as often as the calendar asks) and when you press S.'
+    $v = Invoke-TuiForm -Title 'Subscribe to a calendar' -Fields $fields -Intro $intro -Validate {
+        param($v)
+        if (([string]$v.Url).Trim() -notmatch '^(?i)(https?|webcals?)://.+') { return 'Enter the address (https://... or webcal://...).' }
+        return $null
+    }
+    if ($null -eq $v) { return }
+    $url = ([string]$v.Url).Trim()
+    Show-TuiBusy -Title 'Subscribe' -Message 'Downloading the calendar...'
+    try { $feed = Get-SubscriptionFeed -Url $url }
+    catch { Show-TuiMessage -Title 'Subscription failed' -Message $_.Exception.Message -IsError; return }
+    $name = ([string]$v.Name).Trim()
+    if (-not $name) { $name = $feed.Name }
+    if (-not $name) { $name = ([Uri](ConvertTo-FeedUrl $url)).Host }
+    $acc = New-AccountObject -Type 'Subscription' -Name $name
+    $acc.ServerUrl = $url
+    $color = $script:CalendarPalette[$script:Config.Calendars.Count % $script:CalendarPalette.Count]
+    $cal = New-CalendarObject -AccountId $acc.Id -Name $name -RemoteId $url -Color $color
+    $cal.ReadOnly = $true
+    $script:Config.Accounts.Add($acc)
+    $script:Config.Calendars.Add($cal)
+    Save-Config
+    Invoke-SyncInteractive -AccountId $acc.Id -Force
+}
+
 function New-LocalCalendarInteractive {
     <# Creates a calendar that only exists on this computer. #>
     $name = Read-TuiInput -Title 'New local calendar' -Prompt 'Name of the calendar:'
@@ -3836,6 +3997,26 @@ function Edit-AccountSetting {
         New-FormField -Key 'Name' -Label 'Account name' -Value $Account.Name
         New-FormField -Key 'Enabled' -Label 'Synchronise' -Type 'bool' -Value ([bool]$Account.Enabled)
     )
+    if ($Account.Type -eq 'Subscription') {
+        $fields += New-FormField -Key 'ServerUrl' -Label 'Calendar address' -Value $Account.ServerUrl -Hint 'The .ics or webcal:// link'
+        $v = Invoke-TuiForm -Title ('Subscription: ' + $Account.Name) -Fields $fields -Validate {
+            param($v)
+            if (([string]$v.ServerUrl).Trim() -notmatch '^(?i)(https?|webcals?)://.+') { return 'Enter the address (https://... or webcal://...).' }
+            return $null
+        }
+        if ($null -eq $v) { return }
+        if (([string]$v.Name).Trim()) { $Account.Name = ([string]$v.Name).Trim() }
+        $Account.Enabled = [bool]$v.Enabled
+        $url = ([string]$v.ServerUrl).Trim()
+        if ($url -ne $Account.ServerUrl) {
+            $Account.ServerUrl = $url
+            foreach ($c in @($script:Config.Calendars | Where-Object { $_.AccountId -eq $Account.Id })) {
+                $c.RemoteId = $url; $c.CTag = ''; $c.LastSync = ''
+            }
+        }
+        Save-Config
+        return
+    }
     if ($Account.Type -eq 'Google') {
         $fields += New-FormField -Key 'ClientId' -Label 'Client ID' -Value $Account.ClientId
         $fields += New-FormField -Key 'ClientSecret' -Label 'Client secret' -Type 'password' -Hint 'Leave blank to keep the current secret'
@@ -3870,7 +4051,9 @@ function Remove-AccountInteractive {
     <# Removes an account and its calendars from PSCalendar. #>
     param($Account)
     if ($Account.Type -eq 'Local') { Show-TuiMessage -Title 'Local calendars' -Message 'The local account cannot be removed. Remove single local calendars instead.'; return }
-    if (-not (Read-TuiConfirm -Title 'Remove account' -Message ("Remove '{0}' and its calendars from PSCalendar? Nothing is deleted on the server." -f $Account.Name))) { return }
+    $msg = "Remove '{0}' and its calendars from PSCalendar? Nothing is deleted on the server." -f $Account.Name
+    if ($Account.Id -eq $script:HolidayAccountId) { $msg = "Remove '{0}'? You can turn it back on in Options (O)." -f $Account.Name }
+    if (-not (Read-TuiConfirm -Title 'Remove account' -Message $msg)) { return }
     foreach ($c in @($script:Config.Calendars | Where-Object { $_.AccountId -eq $Account.Id })) { Remove-LocalCalendar $c }
     [void]$script:Config.Accounts.Remove($Account)
     $script:TokenCache.Remove($Account.Id)
@@ -3954,22 +4137,26 @@ function Show-CalendarManager {
             elseif ($kn -eq 'Spacebar' -and $null -ne $row -and $row.Kind -eq 'Calendar') { $row.Item.Visible = -not $row.Item.Visible; $script:DataVersion++; Save-Config }
             elseif ($kn -eq 'Y' -and $null -ne $row -and $row.Kind -eq 'Calendar' -and -not (Test-CalendarIsLocal $row.Item)) { $row.Item.Sync = -not $row.Item.Sync; Save-Config }
             elseif ($kn -eq 'R' -and $null -ne $acc) {
-                if ($acc.Type -eq 'Local') { $script:State.Message = 'Local calendars have no server.' } else { Update-AccountCalendar $acc }
+                if ($acc.Type -eq 'Local') { $script:State.Message = 'Local calendars have no server.' }
+                elseif ($acc.Type -eq 'Subscription') { $script:State.Message = 'A subscription has a single calendar. Press S to download it again.' }
+                else { Update-AccountCalendar $acc }
             }
             elseif ($kn -eq 'S' -and $null -ne $acc) {
-                if ($acc.Type -eq 'Local') { $script:State.Message = 'Local calendars are not synchronised.' } else { Invoke-SyncInteractive -AccountId $acc.Id }
+                if ($acc.Type -eq 'Local') { $script:State.Message = 'Local calendars are not synchronised.' } else { Invoke-SyncInteractive -AccountId $acc.Id -Force }
             }
             elseif ($kn -eq 'Delete' -and $null -ne $row) {
                 if ($row.Kind -eq 'Account') { Remove-AccountInteractive $row.Item }
                 else {
                     $c = $row.Item
                     $local = Test-CalendarIsLocal $c
-                    if ($script:Config.Calendars.Count -le 1) {
-                        Show-TuiMessage -Title 'Remove calendar' -Message 'You need at least one calendar.'
+                    $writable = @($script:Config.Calendars | Where-Object { -not $_.ReadOnly })
+                    if (-not $c.ReadOnly -and $writable.Count -le 1) {
+                        Show-TuiMessage -Title 'Remove calendar' -Message 'You need at least one calendar you can add events to.'
                     }
                     else {
                         $msg = "Remove '{0}' from PSCalendar? Nothing is deleted on the server." -f $c.Name
                         if ($local) { $msg = "Delete the local calendar '{0}' and all its events?" -f $c.Name }
+                        if ($c.Id -eq $script:HolidayCalendarId) { $msg = "Remove '{0}'? You can turn it back on in Options (O)." -f $c.Name }
                         if (Read-TuiConfirm -Title 'Remove calendar' -Message $msg) { Remove-LocalCalendar $c; Save-Config; Save-EventStore }
                     }
                 }
@@ -4000,6 +4187,7 @@ function Edit-AppSetting {
         New-FormField -Key 'DefaultDuration' -Label 'Event length' -Value ([string]$s.DefaultDuration) -Hint 'Default length of new events in minutes'
         New-FormField -Key 'DefaultReminder' -Label 'Default reminder' -Value ([string]$s.DefaultReminder) -Hint 'For new events, e.g. 15 or 10, 1h. Blank = none.'
         New-FormField -Key 'AgendaDays' -Label 'Agenda days' -Value ([string]$s.AgendaDays) -Hint 'How many days the agenda view lists'
+        New-FormField -Key 'Holidays' -Label 'US holidays' -Type 'choice' -Value $script:HolidayModes[[string]$s.Holidays] -Options @($script:HolidayModes.Values) -Hint 'Read-only holidays calendar, downloaded from Google once a day'
         New-FormField -Key 'SyncOnStartup' -Label 'Sync on start' -Type 'bool' -Value ([bool]$s.SyncOnStartup)
         New-FormField -Key 'AutoSyncMinutes' -Label 'Auto sync every' -Value ([string]$s.AutoSyncMinutes) -Hint 'Minutes between automatic syncs while PSCalendar is open (0 = off)'
         New-FormField -Key 'PastDays' -Label 'Sync past days' -Value ([string]$s.PastDays) -Hint 'How far back events are downloaded'
@@ -4019,6 +4207,8 @@ function Edit-AppSetting {
     }
     if ($null -eq $v) { return }
     $windowChanged = ([int]$v.PastDays -ne [int]$s.PastDays -or [int]$v.FutureDays -ne [int]$s.FutureDays)
+    foreach ($k in $script:HolidayModes.Keys) { if ($script:HolidayModes[$k] -eq $v.Holidays) { $s.Holidays = $k } }
+    Update-HolidayCalendar
     $s.WeekStart = [string]$v.WeekStart
     $s.TimeFormat = [string]$v.TimeFormat
     $s.DayStartHour = [int]$v.DayStartHour
@@ -4037,19 +4227,25 @@ function Edit-AppSetting {
     if ($windowChanged) { foreach ($c in $script:Config.Calendars) { $c.CTag = '' } }
     $script:DataVersion++
     Save-Config
+    Save-EventStore
+    # Download the holidays straight away when they were just switched on.
+    $hol = Get-Calendar $script:HolidayCalendarId
+    if ($null -ne $hol -and $hol.Sync -and -not $hol.LastSync) { Invoke-SyncInteractive -AccountId $script:HolidayAccountId }
 }
 
 function Invoke-SyncInteractive {
-    <# Runs a sync with a progress box and reports the result in the status line. #>
-    param([string]$AccountId = '')
+    <# Runs a sync with a progress box and reports the result in the status line. -Force also refreshes subscriptions. #>
+    param([string]$AccountId = '', [switch]$Force)
     if (-not (Test-HasSyncCalendar)) {
         $script:LastSyncAttempt = Get-Date
         $script:State.Message = 'No synchronised calendars yet. Press C to add iCloud or Google accounts.'
         return
     }
     $script:SyncSnapshot = Save-ScreenBuffer
-    try { $res = Sync-AllCalendar -AccountId $AccountId }
+    try { $res = Sync-AllCalendar -AccountId $AccountId -Force:$Force }
     finally { Restore-ScreenBuffer $script:SyncSnapshot; $script:SyncSnapshot = $null }
+    # A background sync that had nothing due (only subscriptions) stays quiet.
+    if (-not $Force -and $res.Calendars -eq 0 -and $res.Errors -eq 0) { return }
     $script:State.Message = $res.Summary
     if ($res.Errors) { $script:State.MessageColor = 'Red' } else { $script:State.MessageColor = 'Green' }
 }
@@ -4151,7 +4347,7 @@ function Write-MonthView {
             $hfg = 'White'; $hbg = 'DarkGray'
             if (-not $inMonth) { $hfg = 'Gray'; $hbg = 'Black' }
             if ($date -eq $today) { $hfg = 'Black'; $hbg = 'Yellow'; $label += ' today' }
-            if ($date -eq $sel) { $hfg = 'Black'; $hbg = 'Cyan' }
+            if ($date -eq $sel) { $hfg = $script:CursorFg; $hbg = $script:CursorBg }
             $cx = $x
             if ($d -gt 0) {
                 for ($i = 0; $i -lt $cellH; $i++) { Write-Buffer -X $x -Y ($y + $i) -Text $script:G.V -Fg DarkGray }
@@ -4216,7 +4412,7 @@ function Write-Timeline {
         if ($n -eq 1) { $label = $c.Day.ToString('dddd, MMMM d') }
         $fg = 'White'; $bg = 'DarkGray'
         if ($c.Day -eq $today) { $fg = 'Black'; $bg = 'Yellow' }
-        if ($c.Day -eq $s.Date) { $fg = 'Black'; $bg = 'Cyan' }
+        if ($c.Day -eq $s.Date) { $fg = $script:CursorFg; $bg = $script:CursorBg }
         Write-Buffer -X $c.X -Y $Top -Text (Format-Center $label ($c.W - 1)) -Fg $fg -Bg $bg -Width ($c.W - 1)
     }
     # All-day rows.
@@ -4531,11 +4727,12 @@ EVENTS
   /                   search all events (Esc clears the search)
 
 CALENDARS AND SYNC
-  C                   calendars and accounts: add iCloud, Google, CalDAV and
-                      local calendars, show/hide, colours, default calendar
+  C                   calendars and accounts: add iCloud, Google, CalDAV,
+                      subscribed (.ics) and local calendars, show/hide,
+                      colours, default calendar
   S or F5             synchronise now
   L                   sync log
-  O                   options (week start, clock, sync window, conflicts ...)
+  O                   options (week start, clock, US holidays, sync window ...)
 
   Q or Ctrl+C         quit
 
@@ -4659,7 +4856,7 @@ function Invoke-MainKey {
         'Delete' { if ($null -ne $s.Current -and $s.View -ne 'Month') { Remove-CalEventInteractive $s.Current } elseif ($s.View -eq 'Month') { Set-View 'Day'; $s.Message = 'Select an event with Up/Down, then press Del.' }; return }
         'Escape' { if ($s.Search) { $s.Search = ''; $s.AgendaIndex = 0; $s.AgendaScroll = 0 }; return }
         'F1' { Show-TuiText -Title 'PSCalendar help' -Lines @($script:HelpText -split "`r?`n") -Width 84; return }
-        'F5' { Invoke-SyncInteractive; return }
+        'F5' { Invoke-SyncInteractive -Force; return }
         'Spacebar' { if ($null -ne $s.Current -and $s.View -ne 'Month') { Show-TuiText -Title 'Event details' -Lines (Get-EventDetailLine -Instance $s.Current -Width 70) -Width 76 }; return }
     }
     switch -CaseSensitive ($ch) {
@@ -4699,7 +4896,7 @@ function Invoke-MainKey {
             if ($null -ne $t) { $s.Search = $t.Trim(); Set-View 'Agenda' }
         }
         'c' { Show-CalendarManager }
-        's' { Invoke-SyncInteractive }
+        's' { Invoke-SyncInteractive -Force }
         'l' {
             $lines = $script:SyncLog.ToArray()
             if ($lines.Count -eq 0) { $lines = @('Nothing synchronised yet.') }
@@ -4738,7 +4935,9 @@ function Start-Tui {
         if ($script:UseAnsi) { [Console]::Write($script:E + '[?1049h' + $script:E + '[?25l') }
         $script:TuiActive = $true
         $null = Update-ScreenSize -Force
-        if (-not (Test-HasSyncCalendar) -and $script:Events.Count -eq 0) {
+        $ownEvents = @($script:Events | Where-Object { $_.CalendarId -ne $script:HolidayCalendarId }).Count
+        $accounts = @($script:Config.Accounts | Where-Object { $_.Type -ne 'Local' -and $_.Id -ne $script:HolidayAccountId }).Count
+        if ($accounts -eq 0 -and $ownEvents -eq 0) {
             $script:State.Message = 'Welcome! Press N to add an event, C to connect iCloud or Google calendars, ? for help.'
         }
         if ($script:Config.Settings.SyncOnStartup -and -not $SkipSync -and (Test-HasSyncCalendar)) {
