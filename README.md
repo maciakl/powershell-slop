@@ -28,6 +28,8 @@ Current version: **0.1.0**
   | 6   | AdGuard DNS    | 94.140.14.14, 94.140.15.15       | 2a10:50c0::ad1:ff, 2a10:50c0::ad2:ff            |
   | 7   | Custom DNS     | your own addresses               | your own addresses                              |
 
+- Custom DNS asks for a primary and an optional secondary server (IPv4 or IPv6), then asks
+  you to confirm; press Esc at any point to go back without changing anything
 - Custom addresses are validated; invalid entries get a clear error and you are asked again
 - **Restore original** puts back the DNS settings from before the first change, even after
   the script was closed and reopened

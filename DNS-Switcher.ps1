@@ -1354,10 +1354,106 @@ function Select-NetworkAdapter {
     return $selected
 }
 
+function Read-InputLine {
+    <#
+    .SYNOPSIS
+        Reads a line of text from the console. Esc (or Ctrl+C) cancels.
+    .OUTPUTS
+        The text entered, or $null when cancelled.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Prompt
+    )
+
+    Write-Host "  ${Prompt}: " -NoNewline
+    $buffer = New-Object -TypeName 'System.Text.StringBuilder'
+
+    while ($true) {
+        $keyInfo = [Console]::ReadKey($true)
+        $isCtrlC = ($keyInfo.Key -eq [ConsoleKey]::C) -and
+                   (($keyInfo.Modifiers -band [ConsoleModifiers]::Control) -ne 0)
+
+        if ($keyInfo.Key -eq [ConsoleKey]::Escape -or $isCtrlC) {
+            Write-Host ''
+            return $null
+        }
+        elseif ($keyInfo.Key -eq [ConsoleKey]::Enter) {
+            Write-Host ''
+            return $buffer.ToString()
+        }
+        elseif ($keyInfo.Key -eq [ConsoleKey]::Backspace) {
+            if ($buffer.Length -gt 0) {
+                [void]$buffer.Remove($buffer.Length - 1, 1)
+                Write-Host "`b `b" -NoNewline
+            }
+        }
+        elseif (-not [char]::IsControl($keyInfo.KeyChar) -and $buffer.Length -lt 64) {
+            [void]$buffer.Append($keyInfo.KeyChar)
+            Write-Host $keyInfo.KeyChar -NoNewline -ForegroundColor White
+        }
+    }
+}
+
+function Read-DnsServerField {
+    <#
+    .SYNOPSIS
+        Asks for a single DNS server address until it is valid, skipped or cancelled.
+    .OUTPUTS
+        An object with Cancelled, Address and Family. Address is $null when skipped.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Prompt,
+
+        [Parameter(Mandatory)]
+        [bool]$IPv6Enabled,
+
+        [switch]$Optional,
+
+        [string]$Primary
+    )
+
+    while ($true) {
+        $answer = Read-InputLine -Prompt $Prompt
+        if ($null -eq $answer) {
+            return [pscustomobject]@{ Cancelled = $true; Address = $null; Family = $null }
+        }
+
+        $answer = $answer.Trim()
+        if (-not $answer) {
+            if ($Optional) {
+                return [pscustomobject]@{ Cancelled = $false; Address = $null; Family = $null }
+            }
+            Write-Host '  Error: a primary DNS server is required.' -ForegroundColor Red
+            continue
+        }
+
+        $check = Test-DnsServerAddress -Address $answer
+        if (-not $check.IsValid) {
+            Write-Host ('  Error: "{0}" {1}' -f $answer, $check.Reason) -ForegroundColor Red
+        }
+        elseif ($check.Family -eq 'IPv6' -and -not $IPv6Enabled) {
+            Write-Host ('  Error: "{0}" is an IPv6 address, but IPv6 is disabled on this adapter.' -f $answer) -ForegroundColor Red
+        }
+        elseif ($Primary -and $check.Address -eq $Primary) {
+            Write-Host '  Error: the secondary server must be different from the primary.' -ForegroundColor Red
+        }
+        else {
+            return [pscustomobject]@{ Cancelled = $false; Address = $check.Address; Family = $check.Family }
+        }
+    }
+}
+
 function Read-CustomDnsServer {
     <#
     .SYNOPSIS
-        Asks for custom DNS server addresses until they are valid or the user cancels.
+        Asks for a primary and secondary custom DNS server, then for confirmation.
+        Esc cancels at any point without changing anything.
     .OUTPUTS
         An object with IPv4 and IPv6 address arrays, or $null when cancelled.
     #>
@@ -1373,7 +1469,6 @@ function Read-CustomDnsServer {
     Clear-Host
     Reset-Frame
     [Console]::CursorVisible = $true
-    [Console]::TreatControlCAsInput = $false
 
     try {
         foreach ($line in (New-TitleLines -Subtitle 'Custom DNS')) {
@@ -1386,56 +1481,50 @@ function Read-CustomDnsServer {
             Write-Host ''
         }
 
-        Write-Host '  Enter one or more DNS server addresses for ' -NoNewline
+        Write-Host '  Enter a primary and a secondary DNS server for ' -NoNewline
         Write-Host $Adapter.Name -ForegroundColor White -NoNewline
         Write-Host '.'
-        Write-Host '  Separate addresses with commas or spaces. IPv4 and IPv6 may be mixed.' -ForegroundColor DarkGray
-        Write-Host '  Example: 1.1.1.1, 8.8.8.8, 2606:4700:4700::1111' -ForegroundColor DarkGray
+        Write-Host '  Each can be an IPv4 or IPv6 address, e.g. 1.1.1.1 or 2606:4700:4700::1111' -ForegroundColor DarkGray
+        Write-Host '  The secondary server is optional; leave it empty and press Enter to skip it.' -ForegroundColor DarkGray
         if (-not $State.IPv6Enabled) {
             Write-Host '  IPv6 is disabled on this adapter, so only IPv4 addresses can be used.' -ForegroundColor Yellow
         }
-        Write-Host '  Leave the line empty and press Enter to cancel.' -ForegroundColor DarkGray
+        Write-Host '  Press Esc at any time to go back without changing anything.' -ForegroundColor DarkGray
         Write-Host ''
 
+        $primary = Read-DnsServerField -Prompt 'Primary DNS server  ' -IPv6Enabled $State.IPv6Enabled
+        if ($primary.Cancelled) { return $null }
+
+        $secondary = Read-DnsServerField -Prompt 'Secondary DNS server' -IPv6Enabled $State.IPv6Enabled -Optional -Primary $primary.Address
+        if ($secondary.Cancelled) { return $null }
+
+        $ipv4 = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        $ipv6 = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($entry in @($primary, $secondary)) {
+            if ($null -eq $entry.Address) { continue }
+            if ($entry.Family -eq 'IPv4') { $ipv4.Add($entry.Address) } else { $ipv6.Add($entry.Address) }
+        }
+
+        Write-Host ''
+        Write-Host '  Apply these DNS servers? ' -NoNewline
+        Write-Host 'Enter' -ForegroundColor White -NoNewline
+        Write-Host ' Apply   ' -NoNewline
+        Write-Host 'Esc' -ForegroundColor White -NoNewline
+        Write-Host ' Cancel'
+        [Console]::CursorVisible = $false
+
         while ($true) {
-            $answer = Read-Host -Prompt '  DNS servers'
-            if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
-
-            $ipv4   = New-Object -TypeName 'System.Collections.Generic.List[string]'
-            $ipv6   = New-Object -TypeName 'System.Collections.Generic.List[string]'
-            $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
-
-            foreach ($token in ($answer -split '[,;\s]+')) {
-                if (-not $token) { continue }
-                $check = Test-DnsServerAddress -Address $token
-                if (-not $check.IsValid) {
-                    $errors.Add(('"{0}" {1}' -f $token, $check.Reason))
-                }
-                elseif ($check.Family -eq 'IPv4') {
-                    if (-not $ipv4.Contains($check.Address)) { $ipv4.Add($check.Address) }
-                }
-                elseif (-not $State.IPv6Enabled) {
-                    $errors.Add(('"{0}" is an IPv6 address, but IPv6 is disabled on this adapter.' -f $token))
-                }
-                elseif (-not $ipv6.Contains($check.Address)) {
-                    $ipv6.Add($check.Address)
-                }
+            $keyInfo = [Console]::ReadKey($true)
+            $isCtrlC = ($keyInfo.Key -eq [ConsoleKey]::C) -and
+                       (($keyInfo.Modifiers -band [ConsoleModifiers]::Control) -ne 0)
+            if ($keyInfo.Key -eq [ConsoleKey]::Escape -or $isCtrlC) { return $null }
+            if ($keyInfo.Key -eq [ConsoleKey]::Enter) {
+                return [pscustomobject]@{ IPv4 = $ipv4.ToArray(); IPv6 = $ipv6.ToArray() }
             }
-
-            if ($errors.Count -gt 0) {
-                Write-Host ''
-                foreach ($message in $errors) { Write-Host "  Error: $message" -ForegroundColor Red }
-                Write-Host '  Please enter valid DNS server addresses (or leave empty to cancel).' -ForegroundColor Yellow
-                Write-Host ''
-                continue
-            }
-
-            return [pscustomobject]@{ IPv4 = $ipv4.ToArray(); IPv6 = $ipv6.ToArray() }
         }
     }
     finally {
         [Console]::CursorVisible = $false
-        [Console]::TreatControlCAsInput = $true
         Clear-Host
         Reset-Frame
     }
