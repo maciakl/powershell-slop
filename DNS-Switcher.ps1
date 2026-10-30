@@ -546,6 +546,8 @@ function Get-NetworkAdapter {
             InterfaceGuid        = [string]$cim.InterfaceGuid
             InterfaceDescription = [string]$cim.InterfaceDescription
             Status               = Get-AdapterStatusText -CimAdapter $cim
+            # Same test Get-NetAdapter -Physical uses. VPN and other virtual adapters have no connector.
+            IsPhysical           = [bool]$cim.ConnectorPresent -and -not [bool]$cim.Virtual
         }
     }
 }
@@ -554,6 +556,8 @@ function Get-PreferredAdapter {
     <#
     .SYNOPSIS
         Returns the adapter used for internet traffic (lowest metric default route).
+        Physical adapters win over virtual ones (VPN clients such as Cato often give their
+        virtual adapter the lowest metric, but DNS should normally be set on the real adapter).
     #>
     [CmdletBinding()]
     param()
@@ -563,8 +567,11 @@ function Get-PreferredAdapter {
         throw 'No network adapters were found on this computer.'
     }
 
+    # Physical adapters first, keeping the original order within each group.
+    $adapters   = @(@($adapters | Where-Object { $_.IsPhysical }) + @($adapters | Where-Object { -not $_.IsPhysical }))
     $upAdapters = @($adapters | Where-Object { $_.Status -eq 'Up' })
     $upIndexes  = @($upAdapters | ForEach-Object { $_.ifIndex })
+    $physicalIndexes = @($upAdapters | Where-Object { $_.IsPhysical } | ForEach-Object { $_.ifIndex })
 
     $routes = @(Get-CimNetwork -ClassName 'MSFT_NetRoute' -Filter "DestinationPrefix = '0.0.0.0/0'" |
             Where-Object { $upIndexes -contains [int]$_.InterfaceIndex })
@@ -577,6 +584,8 @@ function Get-PreferredAdapter {
             $metrics[[int]$interface.InterfaceIndex] = [int]$interface.InterfaceMetric
         }
         $best = $routes | Sort-Object -Property @{
+            Expression = { $physicalIndexes -notcontains [int]$_.InterfaceIndex }
+        }, @{
             Expression = {
                 $interfaceMetric = 0
                 if ($metrics.ContainsKey([int]$_.InterfaceIndex)) { $interfaceMetric = $metrics[[int]$_.InterfaceIndex] }
