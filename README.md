@@ -8,27 +8,28 @@ dependencies.
 ========================================================================
   PASSWORD ANALYZER
 ========================================================================
+  Password: Password-123 [visible]
 
-  Password: *********** [hidden]
-
-  Length              : 11
+  Length              : 12
   Uppercase letters   : 1
-  Lowercase letters   : 6
+  Lowercase letters   : 7
   Digits              : 3
   Special characters  : 1
   Character pool      : 95
-  Entropy             : 72.3 bits [##############------]
-  Strength            : MEDIUM
-  Time to crack       : 9 thousand years  @ 10 billion/s
+  Entropy             : 12.7 bits [###-----------------]  (brute force: 78.8)
+  Patterns            : common password "Password", sequence "123"
+  Strength            : WEAK  - built on a common password
+  Time to crack       : instantly  @ 10 billion/s
 
-  Estimated brute-force time by attack scenario
-    Online, throttled                    100/s  901 billion years (> age of universe)
-    Offline, slow hash           10 thousand/s  9 billion years
-    Offline, fast hash (GPU)      10 billion/s  9 thousand years
-    Massive cluster               1 trillion/s  90 years
+  Estimated time to crack by attack scenario
+    Online, throttled                    100/s  34 seconds
+    Offline, slow hash           10 thousand/s  instantly
+    Offline, fast hash (GPU)      10 billion/s  instantly
+    Massive cluster               1 trillion/s  instantly
 
   Suggestions
-    - Use at least 12 characters (16+ is even better).
+    - Built on a very common password; adding digits or symbols barely helps.
+    - Avoid sequences such as abc or 123.
 
 ========================================================================
   [Tab] show/hide   [Esc] clear   [Backspace] delete   [Ctrl+Q] quit
@@ -40,7 +41,14 @@ dependencies.
 - Length and counts of uppercase letters, lowercase letters, digits and
   special characters
 - Character pool size and entropy in bits, with a bar
-- Strength rating: **Weak**, **Medium** or **Strong**
+- Detection of guessable patterns: the most common passwords, dictionary
+  words and names, l33t substitutions (`p@ssw0rd`), reversed words,
+  keyboard walks (`qwerty`, `1qaz2wsx`), sequences (`abc`, `123`), repeats
+  (`aaa`, `abcabc`), years and dates
+- Entropy and crack times that account for those patterns, with the naive
+  brute-force figure shown alongside
+- Strength rating: **Weak**, **Medium** or **Strong**. A password that is,
+  or is mostly made of, a known common password is always **Weak**
 - Estimated brute-force time, both as a headline figure and for four attack
   scenarios
 - Tips for improving the password
@@ -101,16 +109,25 @@ Get-PasswordAnalysis -Password 'Tr0ub4dor&3'
 ```
 
 ```
-Length     : 11
-Uppercase  : 1
-Lowercase  : 6
-Digits     : 3
-Special    : 1
-ClassCount : 4
-PoolSize   : 95
-Entropy    : 72.2709...
-Strength   : Medium
+Length                 : 11
+Uppercase              : 1
+Lowercase              : 6
+Digits                 : 3
+Special                : 1
+ClassCount             : 4
+PoolSize               : 95
+BruteForceEntropy      : 72.2709...
+Entropy                : 62.8...
+Patterns               : {@{Type=Dictionary; Start=4; End=7; Token=b4d; Word=bad; ...}}
+IsCommonPassword       : False
+CommonPasswordRank     : 0
+ContainsCommonPassword : False
+Strength               : Medium
 ```
+
+`Entropy` is the pattern-adjusted figure that the rating and crack times
+use. `Find-PasswordPattern -Password '...'` lists every pattern match found,
+not only the ones used in the cheapest split.
 
 Get help with `Get-Help .\PasswordAnalyzer.ps1 -Full`.
 
@@ -122,10 +139,10 @@ Characters are classified with .NET's Unicode-aware `Char.IsUpper`,
 `Char.IsLower` and `Char.IsDigit`. Everything else, including spaces, is a
 special character.
 
-### Entropy
+### Brute-force entropy
 
 ```
-entropy (bits) = length * log2(pool size)
+brute-force entropy (bits) = length * log2(pool size)
 ```
 
 The pool size is the sum of the character sets used in the password:
@@ -138,7 +155,41 @@ The pool size is the sum of the character sets used in the password:
 | ASCII symbols and space            | 33   |
 | Any non-ASCII character (estimate) | 100  |
 
+### Pattern-adjusted (effective) entropy
+
+Attackers don't brute force blindly. They try leaked and common passwords,
+then words and names with common tweaks, then keyboard walks, dates and so
+on. The analyzer works out the cheapest way to build the password from
+these patterns plus plain characters, in the spirit of Dropbox's
+[zxcvbn](https://github.com/dropbox/zxcvbn), and uses that as the entropy:
+
+| Pattern          | Example            | Cost in bits                                    |
+| ---------------- | ------------------ | ----------------------------------------------- |
+| Common password  | `password`, `123456` | log2(rank + 1); rank 1 is the most popular    |
+| Dictionary word  | `summer`, `michael` | log2(size of the word list), about 9.2         |
+| Keyboard walk    | `qwerty`, `zaq1xsw2` | log2(47) + log2(length)                       |
+| Sequence         | `abc`, `9876`      | log2(4, 10 or 26) + log2(length), +1 if descending |
+| Repeat           | `aaa`, `abcabc`    | cost of the repeated chunk + log2(repeat count) |
+| Year             | `1990`, `2024`     | log2(max(\|year - this year\|, 20))             |
+| Date             | `01011990`         | log2(365) + year cost                           |
+| Any other character | `-`, `x`        | log2(pool size)                                 |
+
+Words are matched case-insensitively, with l33t substitutions undone
+(`@`=a, `0`=o, `3`=e, `1`=i/l, `$`=s, ...) and reversed. Each costs a
+little extra: 1 bit for `Capitalized` or `ALL CAPS` (more for odd mixes),
+1 bit per substitution, and 1 bit for reversal.
+
+For example, `Password-123` costs 2.6 bits (`Password`, #2 on the
+common-password list, capitalized) + 6.6 bits (`-`) + 3.6 bits (`123`),
+about 12.7 bits. The naive brute-force figure is 78.8 bits.
+
+The embedded lists (about 300 common passwords and 600 words and names)
+are far smaller than real cracking dictionaries. A password that passes
+here can still be weak.
+
 ### Strength rating
+
+The rating uses the pattern-adjusted entropy:
 
 | Rating     | Rule                                                        |
 | ---------- | ----------------------------------------------------------- |
@@ -146,7 +197,13 @@ The pool size is the sum of the character sets used in the password:
 | **Medium** | 8+ characters, 2+ character classes, 40+ bits of entropy    |
 | **Weak**   | Anything else                                               |
 
-### Brute-force time
+Common passwords are treated harshly. If the password is on the
+common-password list (ignoring case and l33t, e.g. `P@ssw0rd`), or common
+passwords make up at least half its characters (e.g. `Password-123`,
+`MyPassword2024!`), it is rated **Weak** no matter what the other rules
+say.
+
+### Crack time
 
 On average an attacker finds the password after trying half of all
 combinations:
@@ -167,16 +224,21 @@ beyond that.
 
 ### Limitations
 
-This is a pure brute-force model. It does **not** detect dictionary words,
-names, keyboard patterns (`qwerty`), substitutions (`p@ssw0rd`) or passwords
-from known breaches. Attackers try those first, so a password such as
-`Password123!` is far weaker than the numbers here suggest. Use a password
-manager to generate long, random passwords.
+- The word lists are small and English-only, so they are nowhere near a
+  full breach corpus such as Have I Been Pwned. Words, names and leaked
+  passwords that aren't on the lists are scored as random characters.
+- Patterns are scored on their own. The extra effort an attacker needs to
+  combine several of them is ignored, which makes the estimates
+  slightly pessimistic for long multi-word passphrases.
+- The best defense is still a long, random, unique password from a password
+  manager.
 
 ## Privacy
 
 The password stays in memory. It is never written to disk or sent over the
 network. The screen and the in-memory buffer are cleared when you quit.
+While the password is hidden, the **Patterns** line shows only the kind and
+length of each pattern, not the matched text.
 
 ## Implementation notes
 
